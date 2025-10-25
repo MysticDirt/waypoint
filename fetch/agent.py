@@ -3,6 +3,10 @@
 # via the standard Chat protocol. It calls Claude (Anthropic) when the API key
 # is present, otherwise falls back to mock behavior.
 
+from dotenv import load_dotenv
+load_dotenv()
+
+
 from datetime import datetime, timedelta
 from uuid import uuid4
 from typing import Any, Dict, List
@@ -195,32 +199,34 @@ def _extract_json(text: str) -> Any:
 # NEW: Non-blocking Anthropic call with timeout
 async def _ask_claude_for_json_async(system_prompt: str, user_prompt: str) -> Any:
     """
-    Non-blocking wrapper around Anthropic's sync client.
-    Runs the network call in a worker thread with a hard timeout.
-    Returns {} on any failure so the pipeline can fall back to mock.
+    Non-blocking wrapper around Anthropic's new Messages API.
     """
-    # print("FINAL MOCK", USE_MOCK)
     if USE_MOCK or anthropic_client is None:
         return {}
-    # print("another thing")
-    call = partial(
-        anthropic_client.messages.create,
-        model="claude-3-5-sonnet-latest",
-        max_tokens=2000,
-        temperature=0.1,
-        system=system_prompt,
-        messages=[{"role": "user", "content": user_prompt}],
-    )
+
+    def _call():
+        return anthropic_client.messages.create(
+            model="claude-haiku-4-5",
+            max_tokens=2000,
+            temperature=0.1,
+            system=system_prompt,
+            messages=[{"role": "user", "content": user_prompt}],
+        )
 
     try:
-        # Adjust timeout to your UX/SLA needs
-        msg = await asyncio.wait_for(asyncio.to_thread(call), timeout=12.0)
-        text = "".join(getattr(b, "text", "") for b in msg.content)
+        resp = await asyncio.wait_for(asyncio.to_thread(_call), timeout=15.0)
+
+        # Extract combined text from streaming blocks
+        text = "".join(
+            (b.text if hasattr(b, "text") else "")
+            for b in resp.content
+        )
+
         return _extract_json(text) or {}
-    except (APIStatusError, asyncio.TimeoutError):
+    except Exception as e:
+        print("[Claude] Error:", type(e).__name__, str(e))
         return {}
-    except Exception:
-        return {}
+
 
 # ---------- Mock tool functions (kept for demo + no-key mode) ----------
 def mock_search_flights(from_city: str = "SFO", to_city: str = "ORD", date: str = "") -> Dict[str, Any]:
@@ -408,27 +414,63 @@ async def on_ack(ctx: Context, sender: str, msg: ChatAcknowledgement):
 agent.include(protocol, publish_manifest=True)
 
 if __name__ == "__main__":
-    # Local runner for testing without Agentverse
-    import os
+    import asyncio
     from uagents import Bureau
 
-    print("[Boot] FORCE_MOCK:", FORCE_MOCK,
-          "| USE_MOCK (Claude):", USE_MOCK,
-          "| ASI key present:", bool(AS1_KEY))
+    async def test_asi_step2_shape():
+        steps = [
+            {"tool_name": "search_hotels", "parameters": {"location": "Chicago", "checkin": "2025-11-01", "checkout": "2025-11-03"}},
+            {"tool_name": "search_events", "parameters": {"location": "Chicago", "date": "2025-11-01"}},
+            {"tool_name": "search_flights", "parameters": {"from": "SFO", "to": "ORD", "date": "2025-11-01"}},
+        ]
+        ctx = await asi_execute_steps("Weekend in Chicago", steps)
+        import json as _json
+        print("[ASI ctx_data]", _json.dumps(ctx, indent=2)[:1500])
+        assert isinstance(ctx, dict)
+        assert "hotel_data" in ctx and "event_data" in ctx and "flight_data" in ctx
+        assert "hotels" in ctx["hotel_data"]
+        assert "events" in ctx["event_data"]
+        assert "flights" in ctx["flight_data"]
 
-    # Optional: quick smoke test for ASI key
-    try:
-        ping = client.chat.completions.create(
-            model="asi1-mini",
-            messages=[{"role": "user", "content": "Return JSON: {\"ok\": true}"}],
-            max_tokens=16,
-            temperature=0.0,
+    async def test_full_pipeline():
+        goal = "PLAN: Cheap weekend in Chicago Nov 1–3 from SFO; show events Nov 1"
+        res = await run_plan_pipeline_async(goal.replace("PLAN:", "").strip())
+        import json; print(json.dumps(res, indent=2)[:1500])
+        assert isinstance(res, dict)
+        assert "itinerary" in res and "locations" in res
+        assert all("id" in it for it in res["itinerary"])
+
+
+    async def main():
+        # Boot info
+        print(
+            "[Boot] FORCE_MOCK:", FORCE_MOCK,
+            "| USE_MOCK (Claude):", USE_MOCK,
+            "| ASI key present:", bool(AS1_KEY),
         )
-        print("[ASI] Smoke test:", ping.choices[0].message.content)
-    except Exception as e:
-        print("[ASI] Smoke test failed:", e)
 
-    # Run a full uAgents loop locally
-    bureau = Bureau()         # simple local runtime
-    bureau.add(agent)
-    bureau.run()
+        # Optional: quick ASI smoke test
+        try:
+            ping = client.chat.completions.create(
+                model="asi1-mini",
+                messages=[{"role": "user", "content": 'Return JSON: {"ok": true}'}],
+                max_tokens=16,
+                temperature=0.0,
+            )
+            print("[ASI] Smoke test:", ping.choices[0].message.content)
+        except Exception as e:
+            print("[ASI] Smoke test failed:", e)
+
+        # Step-2 executor shape test (non-blocking)
+        await test_asi_step2_shape()
+
+        # Full pipeline test
+        await test_full_pipeline()
+
+        # Start local uAgents runtime on the existing loop
+        bureau = Bureau()
+        bureau.add(agent)
+        await bureau.run_async()
+
+    asyncio.run(main())
+
