@@ -131,13 +131,13 @@ function PlannerPage() {
   }
 
   return (
-    <div className="min-h-screen bg-gray-50">
+    <div className="min-h-screen bg-gradient-to-br from-[#483D8B] via-[#2d2654] to-[#19192F] page-enter">
       <div className="grid grid-cols-1 md:grid-cols-2 h-screen">
         {/* Left Column - Itinerary */}
         <div className="flex flex-col h-full overflow-hidden">
-          <div className="bg-white shadow-sm border-b">
+          <div className="bg-white/95 backdrop-blur-sm shadow-lg border-b border-purple-200/30">
             <div className="p-6">
-              <h1 className="text-3xl font-bold text-gray-900 mb-6">
+              <h1 className="text-3xl font-bold text-[#483D8B] mb-6">
                 Proactive Life Manager
               </h1>
               
@@ -148,13 +148,13 @@ function PlannerPage() {
                     value={prompt}
                     onChange={(e) => setPrompt(e.target.value)}
                     placeholder="Enter your goal (e.g., 'Plan a cheap cultural weekend in Chicago')"
-                    className="flex-1 px-4 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+                    className="flex-1 px-4 py-2 border border-purple-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-[#483D8B]"
                     disabled={isLoading}
                   />
                   <button
                     type="submit"
                     disabled={isLoading || !prompt.trim()}
-                    className="px-6 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:bg-gray-400 disabled:cursor-not-allowed transition-colors"
+                    className="px-6 py-2 bg-[#483D8B] text-white rounded-lg hover:bg-[#5a4da3] disabled:bg-gray-400 disabled:cursor-not-allowed hover-lift"
                   >
                     Plan
                   </button>
@@ -169,11 +169,11 @@ function PlannerPage() {
             </div>
           </div>
 
-          <div className="flex-1 overflow-y-auto p-6">
+          <div className="flex-1 overflow-y-auto p-6 bg-gradient-to-b from-white/90 to-purple-50/90 backdrop-blur-sm">
             {isLoading && (
               <div className="flex items-center justify-center py-12">
                 <div className="text-center">
-                  <div className="inline-block animate-spin rounded-full h-8 w-8 border-b-2 border-blue-600"></div>
+                  <div className="inline-block animate-spin rounded-full h-8 w-8 border-b-2 border-[#483D8B]"></div>
                   <p className="mt-2 text-gray-600">Loading...</p>
                 </div>
               </div>
@@ -186,7 +186,7 @@ function PlannerPage() {
                   {hasChanges && (
                     <button
                       onClick={handleRefine}
-                      className="px-4 py-2 bg-green-600 text-white rounded-lg hover:bg-green-700 transition-colors"
+                      className="px-4 py-2 bg-[#483D8B] text-white rounded-lg hover:bg-[#5a4da3] hover-lift"
                     >
                       Yes, update plan
                     </button>
@@ -196,7 +196,7 @@ function PlannerPage() {
                 {itinerary.map((item, index) => (
                   <div
                     key={item.id}
-                    className={`p-4 rounded-lg border-2 ${getTypeColor(item.type)} transition-all hover:shadow-md`}
+                    className={`p-4 rounded-lg border-2 ${getTypeColor(item.type)} hover-lift`}
                   >
                     <div className="flex justify-between items-start">
                       <div className="flex-1">
@@ -253,7 +253,7 @@ function PlannerPage() {
         </div>
 
         {/* Right Column - Map */}
-        <div className="h-full bg-gray-200 relative">
+        <div className="h-full bg-purple-900/20 relative">
           <MapContainer
             center={[41.8781, -87.6298]}
             zoom={12}
