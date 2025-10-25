@@ -406,3 +406,29 @@ async def on_ack(ctx: Context, sender: str, msg: ChatAcknowledgement):
     pass
 
 agent.include(protocol, publish_manifest=True)
+
+if __name__ == "__main__":
+    # Local runner for testing without Agentverse
+    import os
+    from uagents import Bureau
+
+    print("[Boot] FORCE_MOCK:", FORCE_MOCK,
+          "| USE_MOCK (Claude):", USE_MOCK,
+          "| ASI key present:", bool(AS1_KEY))
+
+    # Optional: quick smoke test for ASI key
+    try:
+        ping = client.chat.completions.create(
+            model="asi1-mini",
+            messages=[{"role": "user", "content": "Return JSON: {\"ok\": true}"}],
+            max_tokens=16,
+            temperature=0.0,
+        )
+        print("[ASI] Smoke test:", ping.choices[0].message.content)
+    except Exception as e:
+        print("[ASI] Smoke test failed:", e)
+
+    # Run a full uAgents loop locally
+    bureau = Bureau()         # simple local runtime
+    bureau.add(agent)
+    bureau.run()
