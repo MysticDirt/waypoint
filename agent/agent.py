@@ -159,8 +159,12 @@ def call_llm_api(system_prompt: str, user_prompt: str) -> Any:
     return {}
 
 # Mock tool functions
-def mock_search_flights(from_city: str = "SFO", to_city: str = "ORD", date: str = "") -> Dict[str, Any]:
+def mock_search_flights(from_city: str = "SFO", to_city: str = "ORD", date: str = "", **kwargs) -> Dict[str, Any]:
     """Mock flight search API"""
+    # Handle 'from' parameter if passed as a keyword argument
+    if 'from' in kwargs:
+        from_city = kwargs['from']
+    
     return {
         "flights": [
             {
