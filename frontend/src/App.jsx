@@ -44,6 +44,7 @@ function MapMarkers({ locations }) {
 function App() {
   const [itinerary, setItinerary] = useState([])
   const [locations, setLocations] = useState([])
+  const [flights, setFlights] = useState([])
   const [prompt, setPrompt] = useState('')
   const [isLoading, setIsLoading] = useState(false)
   const [hasChanges, setHasChanges] = useState(false)
@@ -60,6 +61,7 @@ function App() {
       const response = await axios.post('http://127.0.0.1:8000/plan', { prompt })
       setItinerary(response.data.itinerary || [])
       setLocations(response.data.locations || [])
+      setFlights(response.data.flights || [])
       setHasChanges(false)
     } catch (err) {
       console.error('Error planning:', err)
@@ -97,6 +99,7 @@ function App() {
       })
       setItinerary(response.data.itinerary || [])
       setLocations(response.data.locations || [])
+      setFlights(response.data.flights || [])
       setHasChanges(false)
     } catch (err) {
       console.error('Error refining:', err)
@@ -179,71 +182,128 @@ function App() {
               </div>
             )}
 
-            {!isLoading && itinerary.length > 0 && (
-              <div className="space-y-4">
-                <div className="flex justify-between items-center mb-4">
-                  <h2 className="text-xl font-semibold text-gray-800">Your Itinerary</h2>
-                  {hasChanges && (
-                    <button
-                      onClick={handleRefine}
-                      className="px-4 py-2 bg-green-600 text-white rounded-lg hover:bg-green-700 transition-colors"
-                    >
-                      Yes, update plan
-                    </button>
-                  )}
-                </div>
-
-                {itinerary.map((item, index) => (
-                  <div
-                    key={item.id}
-                    className={`p-4 rounded-lg border-2 ${getTypeColor(item.type)} transition-all hover:shadow-md`}
-                  >
-                    <div className="flex justify-between items-start">
-                      <div className="flex-1">
-                        <div className="flex items-center gap-2 mb-2">
-                          <h3 className="font-semibold text-lg">{item.title}</h3>
-                          <span className={`px-2 py-1 text-xs rounded-full font-medium ${getTypeColor(item.type)}`}>
-                            {item.type}
-                          </span>
+            {!isLoading && (itinerary.length > 0 || flights.length > 0) && (
+              <div className="space-y-6">
+                {/* Flight Options Section */}
+                {flights.length > 0 && (
+                  <div className="space-y-4">
+                    <h2 className="text-xl font-semibold text-gray-800">Flight Options</h2>
+                    <div className="space-y-3">
+                      {flights.map((flight, index) => (
+                        <div
+                          key={flight.id || index}
+                          className="p-4 rounded-lg border-2 bg-blue-50 border-blue-200 hover:shadow-md transition-all"
+                        >
+                          <div className="flex justify-between items-start">
+                            <div className="flex-1">
+                              <div className="flex items-center gap-2 mb-2">
+                                <h3 className="font-semibold text-lg text-blue-900">
+                                  ✈️ {flight.airline || 'Flight'}
+                                  {flight.flightNumber && ` ${flight.flightNumber}`}
+                                </h3>
+                                <span className="px-2 py-1 text-xs rounded-full font-medium bg-blue-200 text-blue-800">
+                                  {flight.stops === 0 ? 'Nonstop' : `${flight.stops} stop${flight.stops > 1 ? 's' : ''}`}
+                                </span>
+                              </div>
+                              <div className="grid grid-cols-2 gap-2 text-sm text-gray-700">
+                                <div>
+                                  <span className="font-medium">From:</span> {flight.departure}
+                                  {flight.departureTime && ` at ${flight.departureTime}`}
+                                </div>
+                                <div>
+                                  <span className="font-medium">To:</span> {flight.arrival}
+                                  {flight.arrivalTime && ` at ${flight.arrivalTime}`}
+                                </div>
+                              </div>
+                              {flight.duration && (
+                                <p className="text-sm text-gray-600 mt-1">
+                                  Duration: {flight.duration}
+                                </p>
+                              )}
+                            </div>
+                            {flight.price && (
+                              <div className="ml-4 text-right">
+                                <div className="text-2xl font-bold text-blue-900">
+                                  ${flight.price}
+                                </div>
+                                <div className="text-xs text-gray-600">USD</div>
+                              </div>
+                            )}
+                          </div>
                         </div>
-                        <p className="text-gray-700 mb-2">{item.description}</p>
-                        <p className="text-sm text-gray-600">
-                          {formatTime(item.startTime)}
-                        </p>
-                      </div>
-                      
-                      <div className="flex flex-col gap-1 ml-4">
-                        <button
-                          onClick={() => handleSwap(index, index - 1)}
-                          disabled={index === 0}
-                          className="p-1 text-gray-600 hover:text-gray-900 disabled:text-gray-300 disabled:cursor-not-allowed"
-                          title="Move up"
-                        >
-                          ↑
-                        </button>
-                        <button
-                          onClick={() => handleDelete(item.id)}
-                          className="p-1 text-red-600 hover:text-red-800"
-                          title="Delete"
-                        >
-                          ✕
-                        </button>
-                        <button
-                          onClick={() => handleSwap(index, index + 1)}
-                          disabled={index === itinerary.length - 1}
-                          className="p-1 text-gray-600 hover:text-gray-900 disabled:text-gray-300 disabled:cursor-not-allowed"
-                          title="Move down"
-                        >
-                          ↓
-                        </button>
-                      </div>
+                      ))}
                     </div>
                   </div>
-                ))}
+                )}
+
+                {/* Itinerary Section */}
+                {itinerary.length > 0 && (
+                  <div className="space-y-4">
+                    <div className="flex justify-between items-center mb-4">
+                      <h2 className="text-xl font-semibold text-gray-800">Your Itinerary</h2>
+                      {hasChanges && (
+                        <button
+                          onClick={handleRefine}
+                          className="px-4 py-2 bg-green-600 text-white rounded-lg hover:bg-green-700 transition-colors"
+                        >
+                          Yes, update plan
+                        </button>
+                      )}
+                    </div>
+
+                    {itinerary.map((item, index) => (
+                      <div
+                        key={item.id}
+                        className={`p-4 rounded-lg border-2 ${getTypeColor(item.type)} transition-all hover:shadow-md`}
+                      >
+                        <div className="flex justify-between items-start">
+                          <div className="flex-1">
+                            <div className="flex items-center gap-2 mb-2">
+                              <h3 className="font-semibold text-lg">{item.title}</h3>
+                              <span className={`px-2 py-1 text-xs rounded-full font-medium ${getTypeColor(item.type)}`}>
+                                {item.type}
+                              </span>
+                            </div>
+                            <p className="text-gray-700 mb-2">{item.description}</p>
+                            <p className="text-sm text-gray-600">
+                              {formatTime(item.startTime)}
+                            </p>
+                          </div>
+                          
+                          <div className="flex flex-col gap-1 ml-4">
+                            <button
+                              onClick={() => handleSwap(index, index - 1)}
+                              disabled={index === 0}
+                              className="p-1 text-gray-600 hover:text-gray-900 disabled:text-gray-300 disabled:cursor-not-allowed"
+                              title="Move up"
+                            >
+                              ↑
+                            </button>
+                            <button
+                              onClick={() => handleDelete(item.id)}
+                              className="p-1 text-red-600 hover:text-red-800"
+                              title="Delete"
+                            >
+                              ✕
+                            </button>
+                            <button
+                              onClick={() => handleSwap(index, index + 1)}
+                              disabled={index === itinerary.length - 1}
+                              className="p-1 text-gray-600 hover:text-gray-900 disabled:text-gray-300 disabled:cursor-not-allowed"
+                              title="Move down"
+                            >
+                              ↓
+                            </button>
+                          </div>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
               </div>
             )}
 
-            {!isLoading && itinerary.length === 0 && (
+            {!isLoading && itinerary.length === 0 && flights.length === 0 && (
               <div className="text-center py-12 text-gray-500">
                 <p className="text-lg">No itinerary yet.</p>
                 <p className="mt-2">Enter a goal above to get started!</p>

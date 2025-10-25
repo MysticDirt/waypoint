@@ -21,14 +21,18 @@ app = FastAPI()
 origins = [
     "http://localhost:5173",  # Your frontend's address
     "http://127.0.0.1:5173",
+    "http://localhost:3000",  # Common React dev port
+    "http://127.0.0.1:3000",
 ]
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
     allow_credentials=True,
-    allow_methods=["*"],  # Allows all methods (GET, POST, etc.)
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_headers=["Content-Type", "Authorization", "Accept"],
+    expose_headers=["*"],
+    max_age=3600,
 )
 
 
@@ -44,6 +48,7 @@ class AgentPlanResponse(BaseModel):
     itinerary: list
     logs: list
     locations: list
+    flights: list = []  # List of flight options
     
 # This is the model *we send* to the agent
 class PlanRequest(BaseModel):
