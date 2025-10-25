@@ -1,57 +1,38 @@
-from uagents import Agent, Context, Model
-from uagents.setup import fund_agent_if_low, register_agent_with_mailbox
-from typing import List, Dict, Any
+import os
 import json
+import asyncio
+import threading
+import re
 from datetime import datetime, timedelta
-import uvicorn
-from fastapi import FastAPI
+from typing import List, Dict, Any, Optional
+
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-# new imports
-import os
-from anthropic import Anthropic, APIStatusError
-from dotenv import load_dotenv
+# ---- uAgents client that talks to your Hosted Agent (Agentverse) ----
+from uagents import Agent, Context, Protocol
+from uagents.setup import fund_agent_if_low  # ← keep funding helper
+from uagents_core.contrib.protocols.chat import (
+    ChatAcknowledgement,
+    ChatMessage,
+    EndSessionContent,
+    StartSessionContent,
+    TextContent,
+    chat_protocol_spec,
+)
 
-load_dotenv()
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
-anthropic_client = Anthropic(api_key=ANTHROPIC_API_KEY)
-
-def _ask_claude_for_json(system_prompt: str, user_prompt: str) -> dict | list:
-    """
-    Calls Claude and tries to parse a single JSON object or array from the response.
-    Falls back to {} on failure (your code already guards).
-    """
-    try:
-        msg = anthropic_client.messages.create(
-            model="claude-3-5-sonnet-latest",
-            max_tokens=2000,
-            system=system_prompt,
-            messages=[{"role": "user", "content": user_prompt}],
-            temperature=0.1
-        )
-        # Claude returns a list of content blocks; we expect text in the first
-        text = "".join(block.text for block in msg.content if hasattr(block, "text"))
-        # robust JSON extraction (handles code fences / extra prose)
-        import re, json
-        match = re.search(r'(\{.*\}|\[.*\])', text, re.DOTALL)
-        if match:
-            return json.loads(match.group(1))
-    except APIStatusError as e:
-        # log or print(e) if you want visibility
-        pass
-    except Exception:
-        pass
-    return {}
-
-# swap this into your code: replace the whole mock call_llm_api with:
-def call_llm_api(system_prompt: str, user_prompt: str) -> Any:
-    return _ask_claude_for_json(system_prompt, user_prompt)
-
-
-# FastAPI app for HTTP endpoints
+# ---------------- FastAPI app & CORS ----------------
 app = FastAPI()
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-# Pydantic Models (matching backend)
+# ---------------- Pydantic models ----------------
 class UserGoalRequest(BaseModel):
     prompt: str
 
@@ -74,331 +55,251 @@ class AgentPlanResponse(BaseModel):
     logs: List[str]
     locations: List[Location]
 
-# Initialize the agent
-agent = Agent(
-    name="PlannerAgent",
-    seed="planner_agent_seed_12345",
-    port=8001,
-    endpoint=["http://127.0.0.1:8001/submit"],
-    mailbox=True
-)
+# ---------------- Config ----------------
+TARGET_AGENT_ADDRESS = os.getenv("TARGET_AGENT_ADDRESS", "").strip()  # Hosted Agent address (Agentverse)
+MAILBOX_EMAIL = os.getenv("MAILBOX_EMAIL", "").strip()                # optional (no longer needed for API)
+CLIENT_SEED = os.getenv("CLIENT_AGENT_SEED", "backend_client_seed_123")
 
-# Fund the agent if needed
-fund_agent_if_low(agent.wallet.address())
+if not TARGET_AGENT_ADDRESS:
+    print("WARNING: TARGET_AGENT_ADDRESS is not set. Backend will use mock fallback.")
 
-# Mock LLM function (same as backend)
-def mock_call_llm_api(system_prompt: str, user_prompt: str) -> Any:
-    """Mock LLM API call that returns structured responses based on the prompt"""
-    
-    # Check if this is a decomposition prompt
+# ---------------- Agentverse Bridge (client agent) ----------------
+class AgentverseBridge:
+    """
+    Minimal client uAgent that sends Chat messages to your Hosted Agent (Agentverse)
+    and awaits a single reply. We serialize requests with a lock to keep it simple.
+    """
+    def __init__(self, target_address: str):
+        self.target_address = target_address
+
+        # ✅ mailbox=True is all you need with current uAgents
+        self._agent = Agent(name="BackendClient", seed=CLIENT_SEED, mailbox=True)
+
+        self._protocol = Protocol(spec=chat_protocol_spec)
+        self._lock = asyncio.Lock()
+        self._loop = asyncio.new_event_loop()
+        self._thread: Optional[threading.Thread] = None
+        self._pending_future: Optional[asyncio.Future] = None
+
+        @self._protocol.on_message(ChatMessage)
+        async def on_msg(ctx: Context, sender: str, msg: ChatMessage):
+            if sender != self.target_address:
+                return
+            text = msg.text() or ""
+            fut = self._pending_future
+            if fut and not fut.done():
+                fut.set_result(text)
+
+        @self._protocol.on_message(ChatAcknowledgement)
+        async def on_ack(ctx: Context, sender: str, msg: ChatAcknowledgement):
+            pass
+
+        self._agent.include(self._protocol, publish_manifest=False)
+
+        # Optional faucet; safe to keep
+        try:
+            fund_agent_if_low(self._agent.wallet.address())
+        except Exception:
+            pass
+
+    def start(self):
+        if self._thread and self._thread.is_alive():
+            return
+        def run_loop():
+            asyncio.set_event_loop(self._loop)
+            self._agent.run()
+        self._thread = threading.Thread(target=run_loop, daemon=True)
+        self._thread.start()
+
+    async def send_and_wait(self, message_text: str, timeout: float = 25.0) -> str:
+        if not self.target_address:
+            raise RuntimeError("TARGET_AGENT_ADDRESS not configured.")
+        async with self._lock:
+            self.start()
+
+            def _mk_future():
+                return asyncio.run_coroutine_threadsafe(self._make_future(), self._loop).result()
+            self._pending_future = _mk_future()
+
+            start_session = ChatMessage(
+                timestamp=datetime.utcnow(),
+                msg_id=os.urandom(8).hex(),
+                content=[StartSessionContent(type="start-session")]
+            )
+            user_msg = ChatMessage(
+                timestamp=datetime.utcnow(),
+                msg_id=os.urandom(8).hex(),
+                content=[TextContent(type="text", text=message_text),
+                         EndSessionContent(type="end-session")]
+            )
+
+            def _send():
+                async def _do_send():
+                    await self._agent._context.send(self.target_address, start_session)
+                    await self._agent._context.send(self.target_address, user_msg)
+                return asyncio.run_coroutine_threadsafe(_do_send(), self._loop).result()
+            _send()
+
+            try:
+                result = await asyncio.wait_for(self._pending_future, timeout=timeout)
+                return result
+            except asyncio.TimeoutError:
+                raise TimeoutError("Timed out waiting for hosted agent response.")
+            finally:
+                self._pending_future = None
+
+    async def _make_future(self):
+        return asyncio.get_running_loop().create_future()
+
+# Create a global bridge
+bridge = AgentverseBridge(TARGET_AGENT_ADDRESS)
+
+# ---------------- Mock fallback (unchanged) ----------------
+def call_llm_api(system_prompt: str, user_prompt: str) -> Dict[str, Any]:
     if "Respond ONLY with a JSON list of steps" in system_prompt:
-        # Return mock decomposition steps
         return [
             {"tool_name": "search_hotels", "parameters": {"location": "Chicago", "checkin": "2025-11-01", "checkout": "2025-11-03"}},
             {"tool_name": "search_events", "parameters": {"location": "Chicago", "date": "2025-11-01"}},
             {"tool_name": "search_flights", "parameters": {"from": "SFO", "to": "ORD", "date": "2025-11-01"}}
         ]
-    
-    # Check if this is a synthesis prompt
     elif "Synthesize it into an itinerary" in system_prompt:
-        # Return mock synthesized itinerary
         base_time = datetime.now() + timedelta(days=7)
         return {
             "itinerary": [
-                {
-                    "id": "item_1",
-                    "title": "Flight to Chicago",
-                    "description": "Depart from SFO to ORD on United Airlines",
-                    "startTime": (base_time + timedelta(hours=8)).isoformat(),
-                    "type": "travel"
-                },
-                {
-                    "id": "item_2",
-                    "title": "Check-in at Budget Inn Chicago",
-                    "description": "Affordable downtown accommodation with great reviews",
-                    "startTime": (base_time + timedelta(hours=14)).isoformat(),
-                    "type": "lodging"
-                },
-                {
-                    "id": "item_3",
-                    "title": "Art Institute of Chicago",
-                    "description": "World-renowned art museum with free admission on weekends",
-                    "startTime": (base_time + timedelta(days=1, hours=10)).isoformat(),
-                    "type": "activity"
-                },
-                {
-                    "id": "item_4",
-                    "title": "Chicago Cultural Center",
-                    "description": "Free exhibitions and performances",
-                    "startTime": (base_time + timedelta(days=1, hours=14)).isoformat(),
-                    "type": "activity"
-                },
-                {
-                    "id": "item_5",
-                    "title": "Millennium Park Concert",
-                    "description": "Free outdoor concert at Jay Pritzker Pavilion",
-                    "startTime": (base_time + timedelta(days=1, hours=18)).isoformat(),
-                    "type": "activity"
-                }
+                {"id": "item_1", "title": "Flight to Chicago", "description": "Depart SFO→ORD", "startTime": (base_time+timedelta(hours=8)).isoformat(), "type": "travel"},
+                {"id": "item_2", "title": "Check-in at Budget Inn Chicago", "description": "Affordable downtown", "startTime": (base_time+timedelta(hours=14)).isoformat(), "type": "lodging"},
+                {"id": "item_3", "title": "Art Institute of Chicago", "description": "Free weekend admission", "startTime": (base_time+timedelta(days=1, hours=10)).isoformat(), "type": "activity"},
+                {"id": "item_4", "title": "Chicago Cultural Center", "description": "Free exhibitions", "startTime": (base_time+timedelta(days=1, hours=14)).isoformat(), "type": "activity"},
+                {"id": "item_5", "title": "Millennium Park Concert", "description": "Free outdoor concert", "startTime": (base_time+timedelta(days=1, hours=18)).isoformat(), "type": "activity"},
             ],
             "locations": [
-                {
-                    "name": "O'Hare International Airport",
-                    "latitude": 41.9742,
-                    "longitude": -87.9073,
-                    "linkedItineraryId": "item_1"
-                },
-                {
-                    "name": "Budget Inn Chicago",
-                    "latitude": 41.8781,
-                    "longitude": -87.6298,
-                    "linkedItineraryId": "item_2"
-                },
-                {
-                    "name": "Art Institute of Chicago",
-                    "latitude": 41.8796,
-                    "longitude": -87.6237,
-                    "linkedItineraryId": "item_3"
-                },
-                {
-                    "name": "Chicago Cultural Center",
-                    "latitude": 41.8837,
-                    "longitude": -87.6249,
-                    "linkedItineraryId": "item_4"
-                },
-                {
-                    "name": "Millennium Park",
-                    "latitude": 41.8826,
-                    "longitude": -87.6234,
-                    "linkedItineraryId": "item_5"
-                }
+                {"name": "O'Hare International Airport", "latitude": 41.9742, "longitude": -87.9073, "linkedItineraryId": "item_1"},
+                {"name": "Budget Inn Chicago", "latitude": 41.8781, "longitude": -87.6298, "linkedItineraryId": "item_2"},
+                {"name": "Art Institute of Chicago", "latitude": 41.8796, "longitude": -87.6237, "linkedItineraryId": "item_3"},
+                {"name": "Chicago Cultural Center", "latitude": 41.8837, "longitude": -87.6249, "linkedItineraryId": "item_4"},
+                {"name": "Millennium Park", "latitude": 41.8826, "longitude": -87.6234, "linkedItineraryId": "item_5"},
             ]
         }
-    
-    # Check if this is a refinement prompt
     elif "Accept the changes" in system_prompt:
-        # Parse the modified plan from user_prompt and return it
-        try:
-            # Extract the itinerary from the user prompt
-            import re
-            match = re.search(r'\{.*\}', user_prompt, re.DOTALL)
-            if match:
-                data = json.loads(match.group())
-                # Filter locations to match remaining itinerary items
-                itinerary_ids = {item["id"] for item in data.get("itinerary", [])}
-                filtered_locations = [loc for loc in data.get("locations", []) 
-                                    if loc["linkedItineraryId"] in itinerary_ids]
-                return {
-                    "itinerary": data.get("itinerary", []),
-                    "locations": filtered_locations
-                }
-        except:
-            pass
-        
-        # Default refinement response - return what was sent
-        return json.loads(user_prompt) if "{" in user_prompt else {"itinerary": [], "locations": []}
-    
+        m = re.search(r'\{.*\}', user_prompt, re.DOTALL)
+        if m:
+            data = json.loads(m.group())
+            ids = {i["id"] for i in data.get("itinerary", [])}
+            locs = [l for l in data.get("locations", []) if l.get("linkedItineraryId") in ids]
+            return {"itinerary": data.get("itinerary", []), "locations": locs}
+        return {"itinerary": [], "locations": []}
     return {}
 
-# Mock tool functions
 def mock_search_flights(from_city: str = "SFO", to_city: str = "ORD", date: str = "") -> Dict[str, Any]:
-    """Mock flight search API"""
-    return {
-        "flights": [
-            {
-                "airline": "United Airlines",
-                "flight_number": "UA123",
-                "departure": from_city,
-                "arrival": to_city,
-                "price": 250,
-                "departure_time": "08:00",
-                "arrival_time": "14:00"
-            },
-            {
-                "airline": "Southwest",
-                "flight_number": "SW456",
-                "departure": from_city,
-                "arrival": to_city,
-                "price": 180,
-                "departure_time": "10:30",
-                "arrival_time": "16:30"
-            }
-        ]
-    }
+    return {"flights":[
+        {"airline":"United","flight_number":"UA123","departure":from_city,"arrival":to_city,"price":250,"departure_time":"08:00","arrival_time":"14:00"},
+        {"airline":"Southwest","flight_number":"SW456","departure":from_city,"arrival":to_city,"price":180,"departure_time":"10:30","arrival_time":"16:30"},
+    ]}
 
 def mock_search_hotels(location: str = "Chicago", checkin: str = "", checkout: str = "") -> Dict[str, Any]:
-    """Mock hotel search API"""
-    return {
-        "hotels": [
-            {
-                "name": "Budget Inn Chicago",
-                "address": "123 Downtown St, Chicago, IL",
-                "price_per_night": 75,
-                "rating": 4.2,
-                "latitude": 41.8781,
-                "longitude": -87.6298
-            },
-            {
-                "name": "Chicago Hostel",
-                "address": "456 Loop Ave, Chicago, IL",
-                "price_per_night": 35,
-                "rating": 4.5,
-                "latitude": 41.8850,
-                "longitude": -87.6300
-            }
-        ]
-    }
+    return {"hotels":[
+        {"name":"Budget Inn Chicago","address":"123 Downtown St","price_per_night":75,"rating":4.2,"latitude":41.8781,"longitude":-87.6298},
+        {"name":"Chicago Hostel","address":"456 Loop Ave","price_per_night":35,"rating":4.5,"latitude":41.8850,"longitude":-87.6300},
+    ]}
 
 def mock_search_events(location: str = "Chicago", date: str = "") -> Dict[str, Any]:
-    """Mock events search API"""
-    return {
-        "events": [
-            {
-                "name": "Art Institute of Chicago",
-                "type": "museum",
-                "price": 0,
-                "description": "Free admission on weekends",
-                "latitude": 41.8796,
-                "longitude": -87.6237
-            },
-            {
-                "name": "Chicago Cultural Center",
-                "type": "cultural",
-                "price": 0,
-                "description": "Free exhibitions and performances",
-                "latitude": 41.8837,
-                "longitude": -87.6249
-            },
-            {
-                "name": "Millennium Park Concert",
-                "type": "concert",
-                "price": 0,
-                "description": "Free outdoor concert",
-                "latitude": 41.8826,
-                "longitude": -87.6234
-            }
-        ]
-    }
+    return {"events":[
+        {"name":"Art Institute of Chicago","type":"museum","price":0,"description":"Free weekends","latitude":41.8796,"longitude":-87.6237},
+        {"name":"Chicago Cultural Center","type":"cultural","price":0,"description":"Free exhibitions","latitude":41.8837,"longitude":-87.6249},
+        {"name":"Millennium Park Concert","type":"concert","price":0,"description":"Free outdoor concert","latitude":41.8826,"longitude":-87.6234},
+    ]}
 
-# HTTP endpoint for planning
-@app.post("/plan")
-async def handle_plan(request: UserGoalRequest):
-    """Handle planning request"""
-    prompt = request.prompt
-    logs = []
-    
-    # Step 1: Decompose the goal
-    logs.append(f"Decomposing goal: {prompt}")
-    system_prompt = "You are an expert planner. Break down the user's goal into actionable steps. Respond ONLY with a JSON list of steps."
-    user_prompt = f"Goal: {prompt}"
-    
-    plan_steps_json = call_llm_api(system_prompt, user_prompt)
-    logs.append(f"Generated {len(plan_steps_json)} planning steps")
-    
-    # Step 2: Execute tools
-    context = {}
-    for step in plan_steps_json:
-        tool_name = step.get("tool_name")
-        params = step.get("parameters", {})
-        logs.append(f"Executing tool: {tool_name}")
-        
-        if tool_name == "search_hotels":
-            context["hotel_data"] = mock_search_hotels(**params)
-        elif tool_name == "search_events":
-            context["event_data"] = mock_search_events(**params)
-        elif tool_name == "search_flights":
-            context["flight_data"] = mock_search_flights(**params)
-    
-    logs.append("All tools executed successfully")
-    
-    # Step 3: Synthesize the plan
-    logs.append("Synthesizing final itinerary")
-    system_prompt = """You are a travel assistant. You have JSON data from various sources. 
-    Synthesize it into a comprehensive itinerary. 
-    Respond with a single JSON object: { "itinerary": ItineraryItem[], "locations": Location[] }
-    Each ItineraryItem must have: id, title, description, startTime, type
-    Each Location must have: name, latitude, longitude, linkedItineraryId"""
-    
-    user_prompt = f"Original Goal: {prompt}\n\nCollected Data:\n{json.dumps(context, indent=2)}"
-    
-    final_plan_json = call_llm_api(system_prompt, user_prompt)
-    logs.append("Itinerary synthesis complete")
-    
-    # Step 4: Return the response
-    return {
-        "status": "success",
-        "itinerary": final_plan_json.get("itinerary", []),
-        "logs": logs,
-        "locations": final_plan_json.get("locations", [])
-    }
+# ---------------- Utils ----------------
+def _parse_agent_json(text: str) -> Dict[str, Any]:
+    m = re.search(r'(\{.*\}|\[.*\])', text, re.DOTALL)
+    if not m:
+        return {}
+    try:
+        return json.loads(m.group(1))
+    except Exception:
+        return {}
 
-# HTTP endpoint for refinement
-@app.post("/refine")
-async def handle_refine(request: Dict[str, Any]):
-    """Handle refinement request"""
-    logs = []
-    
-    # Extract the modified itinerary and locations
-    modified_itinerary = request.get("itinerary", [])
-    modified_locations = request.get("locations", [])
-    
-    logs.append(f"Received modified plan with {len(modified_itinerary)} items")
-    
-    # Step 1: Refine the plan
-    system_prompt = """You are an AI assistant. The user has modified their travel plan. 
-    Accept the changes and ensure consistency. 
-    If an item is deleted, remove its corresponding location. 
-    Respond with the new, updated JSON object containing itinerary and locations arrays."""
-    
-    user_prompt = f"Here is the user's modified plan:\n{json.dumps({'itinerary': modified_itinerary, 'locations': modified_locations}, indent=2)}"
-    
-    new_plan_json = call_llm_api(system_prompt, user_prompt)
-    
-    # Ensure locations match itinerary items
-    itinerary_ids = {item["id"] for item in modified_itinerary}
-    filtered_locations = [loc for loc in modified_locations 
-                         if loc["linkedItineraryId"] in itinerary_ids]
-    
-    logs.append(f"Refined plan with {len(modified_itinerary)} items and {len(filtered_locations)} locations")
-    logs.append("Refinement complete")
-    
-    # Step 2: Return the refined response
-    return {
-        "status": "success",
-        "itinerary": modified_itinerary,
-        "logs": logs,
-        "locations": filtered_locations
+# ---------------- FastAPI lifecycle ----------------
+@app.on_event("startup")
+async def _startup():
+    bridge.start()
+
+# ---------------- HTTP Endpoints ----------------
+@app.post("/plan", response_model=AgentPlanResponse)
+async def plan(request: UserGoalRequest):
+    logs: List[str] = []
+    goal = request.prompt.strip()
+
+    if TARGET_AGENT_ADDRESS:
+        try:
+            reply_text = await bridge.send_and_wait(f"PLAN: {goal}", timeout=25.0)
+            data = _parse_agent_json(reply_text)
+            if isinstance(data, dict) and "itinerary" in data and "locations" in data:
+                logs.append("Hosted agent planning completed")
+                return AgentPlanResponse(
+                    status="success",
+                    itinerary=data.get("itinerary", []),
+                    logs=logs,
+                    locations=data.get("locations", [])
+                )
+            logs.append("Hosted agent returned unexpected structure; using mock fallback")
+        except Exception as e:
+            logs.append(f"Hosted agent error: {e}; using mock fallback")
+
+    # mock fallback
+    context = {
+        "hotel_data": mock_search_hotels(),
+        "event_data": mock_search_events(),
+        "flight_data": mock_search_flights(),
     }
+    final_plan = call_llm_api(
+        "Synthesize it into an itinerary.",
+        f"Original Goal: {goal}\n\nCollected Data:\n{json.dumps(context)}"
+    )
+    logs.append("Mock planning completed")
+    return AgentPlanResponse(
+        status="success",
+        itinerary=final_plan.get("itinerary", []),
+        logs=logs,
+        locations=final_plan.get("locations", [])
+    )
+
+@app.post("/refine", response_model=AgentPlanResponse)
+async def refine(request: Dict[str, Any]):
+    logs: List[str] = []
+    payload = json.dumps(request)
+
+    if TARGET_AGENT_ADDRESS:
+        try:
+            reply_text = await bridge.send_and_wait(f"REFINE: {payload}", timeout=25.0)
+            data = _parse_agent_json(reply_text)
+            if isinstance(data, dict) and "itinerary" in data and "locations" in data:
+                logs.append("Hosted agent refinement completed")
+                return AgentPlanResponse(
+                    status="success",
+                    itinerary=data.get("itinerary", []),
+                    logs=logs,
+                    locations=data.get("locations", [])
+                )
+            logs.append("Hosted agent returned unexpected structure; using mock fallback")
+        except Exception as e:
+            logs.append(f"Hosted agent error: {e}; using mock fallback")
+
+    # mock fallback
+    refined = call_llm_api(
+        "Accept the changes and ensure consistency.",
+        f"Here is the user's modified plan:\n{payload}"
+    )
+    itinerary = request.get("itinerary", []) if refined.get("itinerary") == [] else refined.get("itinerary", request.get("itinerary", []))
+    ids = {i["id"] for i in itinerary}
+    locations = [l for l in request.get("locations", []) if l.get("linkedItineraryId") in ids]
+    logs.append("Mock refinement completed")
+    return AgentPlanResponse(status="success", itinerary=itinerary, logs=logs, locations=locations)
 
 @app.get("/health")
 async def health():
-    """Health check endpoint"""
-    return {"status": "healthy", "service": "agent", "address": agent.address}
-
-# Agent startup and shutdown
-@agent.on_event("startup")
-async def startup(ctx: Context):
-    ctx.logger.info(f"PlannerAgent started with address: {agent.address}")
-
-@agent.on_event("shutdown")
-async def shutdown(ctx: Context):
-    ctx.logger.info("PlannerAgent shutting down")
+    return {"status": "healthy", "service": "agent", "target_agent": bool(TARGET_AGENT_ADDRESS)}
 
 if __name__ == "__main__":
-    # Run both the agent and FastAPI server
-    import threading
-    import time
-    
-    # Start the agent in a separate thread
-    def run_agent():
-        agent.run()
-    
-    agent_thread = threading.Thread(target=run_agent)
-    agent_thread.daemon = True
-    agent_thread.start()
-    
-    # Give the agent time to start
-    time.sleep(2)
-    
-    # Run the FastAPI server
+    import uvicorn
     uvicorn.run(app, host="127.0.0.1", port=8001)
