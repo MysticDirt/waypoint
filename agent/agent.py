@@ -1,11 +1,52 @@
 from uagents import Agent, Context, Model
-from uagents.setup import fund_agent_if_low
+from uagents.setup import fund_agent_if_low, register_agent_with_mailbox
 from typing import List, Dict, Any
 import json
 from datetime import datetime, timedelta
 import uvicorn
 from fastapi import FastAPI
 from pydantic import BaseModel
+
+# new imports
+import os
+from anthropic import Anthropic, APIStatusError
+from dotenv import load_dotenv
+
+load_dotenv()
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
+anthropic_client = Anthropic(api_key=ANTHROPIC_API_KEY)
+
+def _ask_claude_for_json(system_prompt: str, user_prompt: str) -> dict | list:
+    """
+    Calls Claude and tries to parse a single JSON object or array from the response.
+    Falls back to {} on failure (your code already guards).
+    """
+    try:
+        msg = anthropic_client.messages.create(
+            model="claude-3-5-sonnet-latest",
+            max_tokens=2000,
+            system=system_prompt,
+            messages=[{"role": "user", "content": user_prompt}],
+            temperature=0.1
+        )
+        # Claude returns a list of content blocks; we expect text in the first
+        text = "".join(block.text for block in msg.content if hasattr(block, "text"))
+        # robust JSON extraction (handles code fences / extra prose)
+        import re, json
+        match = re.search(r'(\{.*\}|\[.*\])', text, re.DOTALL)
+        if match:
+            return json.loads(match.group(1))
+    except APIStatusError as e:
+        # log or print(e) if you want visibility
+        pass
+    except Exception:
+        pass
+    return {}
+
+# swap this into your code: replace the whole mock call_llm_api with:
+def call_llm_api(system_prompt: str, user_prompt: str) -> Any:
+    return _ask_claude_for_json(system_prompt, user_prompt)
+
 
 # FastAPI app for HTTP endpoints
 app = FastAPI()
@@ -38,14 +79,15 @@ agent = Agent(
     name="PlannerAgent",
     seed="planner_agent_seed_12345",
     port=8001,
-    endpoint=["http://127.0.0.1:8001/submit"]
+    endpoint=["http://127.0.0.1:8001/submit"],
+    mailbox=True
 )
 
 # Fund the agent if needed
 fund_agent_if_low(agent.wallet.address())
 
 # Mock LLM function (same as backend)
-def call_llm_api(system_prompt: str, user_prompt: str) -> Any:
+def mock_call_llm_api(system_prompt: str, user_prompt: str) -> Any:
     """Mock LLM API call that returns structured responses based on the prompt"""
     
     # Check if this is a decomposition prompt
