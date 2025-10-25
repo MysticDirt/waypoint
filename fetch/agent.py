@@ -56,102 +56,6 @@ client = OpenAI(
     api_key=AS1_KEY,
 )
 
-import asyncio, json
-from functools import partial
-from typing import Any, Dict, List
-
-def _safe_extract_json(text: str) -> Dict[str, Any]:
-    """
-    Try to parse a JSON object from the model's response.
-    If it isn't valid JSON, return an empty dict so caller can fallback.
-    """
-    if not isinstance(text, str):
-        return {}
-    text = text.strip()
-    try:
-        return json.loads(text)
-    except Exception:
-        # Very defensive: try to find a top-level {...} or [...]
-        import re
-        m = re.search(r"(\{.*\}|\[.*\])", text, re.DOTALL)
-        if not m:
-            return {}
-        try:
-            return json.loads(m.group(1))
-        except Exception:
-            return {}
-
-async def asi_execute_steps(goal: str, steps: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """
-    Uses ASI-1 to perform the 'execution' phase of your trip planner:
-      - search_hotels(location, checkin, checkout)
-      - search_events(location, date)
-      - search_flights(from, to, date)
-
-    Returns STRICT structured JSON:
-      {
-        "hotel_data":  { "hotels":  [ { name, address, price_per_night, rating, latitude, longitude } ... ] },
-        "event_data":  { "events":  [ { name, type, price, description, latitude, longitude } ... ] },
-        "flight_data": { "flights": [ { airline, flight_number, departure, arrival, price, departure_time, arrival_time } ... ] }
-      }
-
-    On error or non-JSON responses, returns {} so the caller can fallback to mocks.
-    """
-    # System prompt: force schema + JSON-only output
-    system_prompt = (
-        "You are a data-gathering travel agent that can use web search and agent tools.\n"
-        "Execute the given steps (search_hotels, search_events, search_flights) and return ONLY JSON with keys:\n"
-        "  hotel_data, event_data, flight_data.\n"
-        "SCHEMAS (arrays may be empty, but keys must exist):\n"
-        "- hotel_data.hotels[]: { name, address, price_per_night, rating, latitude, longitude }\n"
-        "- event_data.events[]: { name, type, price, description, latitude, longitude }\n"
-        "- flight_data.flights[]: { airline, flight_number, departure, arrival, price, departure_time, arrival_time }\n"
-        "No prose, no markdown, no explanations—return only a single JSON object."
-    )
-
-    user_payload = {
-        "goal": goal,
-        "steps": steps,
-    }
-
-    # Prepare a sync call to run off the event loop.
-    def _call():
-        return client.chat.completions.create(
-            model="asi1-mini",  # or "asi1" if you have access and want the larger model
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)},
-            ],
-            max_tokens=2500,
-            temperature=0.1,
-        )
-
-    try:
-        # Run the blocking HTTP in a worker thread; add a hard timeout
-        resp = await asyncio.wait_for(asyncio.to_thread(_call), timeout=25.0)
-        raw = resp.choices[0].message.content if resp and resp.choices else ""
-        data = _safe_extract_json(raw)
-
-        # Normalize shape (guarantee top-level keys and arrays exist)
-        if isinstance(data, dict):
-            hotel_data  = data.get("hotel_data")  or {}
-            event_data  = data.get("event_data")  or {}
-            flight_data = data.get("flight_data") or {}
-            hotel_data.setdefault("hotels", [])
-            event_data.setdefault("events", [])
-            flight_data.setdefault("flights", [])
-
-            return {
-                "hotel_data": hotel_data,
-                "event_data": event_data,
-                "flight_data": flight_data,
-            }
-        return {}
-    except Exception:
-        return {}
-
-agent = Agent()
-
 # We create a new protocol which is compatible with the chat protocol spec. This ensures
 # compatibility between agents
 protocol = Protocol(spec=chat_protocol_spec)
@@ -180,6 +84,120 @@ if not USE_MOCK:
         anthropic_client = None
         USE_MOCK = True
 print(USE_MOCK)
+
+import asyncio, json
+from functools import partial
+from typing import Any, Dict, List
+
+def _safe_extract_json(text: str) -> Dict[str, Any]:
+    """
+    Try to parse a JSON object from the model's response.
+    If it isn't valid JSON, return an empty dict so caller can fallback.
+    """
+    if not isinstance(text, str):
+        return {}
+    text = text.strip()
+    try:
+        return json.loads(text)
+    except Exception:
+        # Very defensive: try to find a top-level {...} or [...]
+        import re
+        m = re.search(r"(\{.*\}|\[.*\])", text, re.DOTALL)
+        if not m:
+            return {}
+        try:
+            return json.loads(m.group(1))
+        except Exception:
+            return {}
+
+# Replace your existing asi_execute_steps with this version.
+# It calls Anthropic Claude (with server-side web search) instead of ASI-1.
+
+async def asi_execute_steps(goal: str, steps: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Stage 2 executor using Claude + Web Search.
+    Returns STRICT structured JSON:
+      {
+        "hotel_data":  { "hotels":  [ ... ] },
+        "event_data":  { "events":  [ ... ] },
+        "flight_data": { "flights": [ ... ] }
+      }
+    On failure, returns {} so caller can fallback to mocks.
+    """
+    # Ensure Anthropic is usable
+    if USE_MOCK or anthropic_client is None:
+        return {}
+
+    system_prompt = (
+        "You are a data-gathering travel agent that can use web search.\n"
+        "Execute the given steps (search_hotels, search_events, search_flights) and return ONLY JSON with keys:\n"
+        "  hotel_data, event_data, flight_data.\n"
+        "Search the internet for reliable sources (e.g., Google Flights, Ticketmaster, Hotels.com, official venues/airlines), "
+        "and extract approximate prices when available. If unknown, use null.\n"
+        "SCHEMAS (arrays may be empty, but keys must exist):\n"
+        "- hotel_data.hotels[]: { name, address, price_per_night, rating, latitude, longitude }\n"
+        "- event_data.events[]: { name, type, price, description, latitude, longitude }\n"
+        "- flight_data.flights[]: { airline, flight_number, departure, arrival, price, departure_time, arrival_time }\n"
+        "No prose, no markdown, no explanations — return only a single JSON object."
+    )
+
+    user_payload = {"goal": goal, "steps": steps}
+    user_content = [
+        {"type": "text", "text": json.dumps(user_payload, ensure_ascii=False)}
+    ]
+
+    def _call():
+        # Server-side web search tool must use the versioned type
+        return anthropic_client.messages.create(
+            model="claude-haiku-4-5",
+            max_tokens=500,
+            temperature=0.1,
+            system=system_prompt,
+            messages=[{"role": "user", "content": user_content}],
+            tools=[{
+                "type": "web_search_20250305",
+                "name": "web_search",
+                "max_uses": 5,
+            }],
+        )
+
+    try:
+        # Run Anthropic call off the event loop, with a hard timeout
+        resp = await asyncio.wait_for(asyncio.to_thread(_call), timeout=35.0)
+
+        # Claude with server-side tools returns a sequence of content blocks.
+        # We expect the final JSON in a text block; collect all text blocks and parse.
+        text_out = "".join(
+            getattr(block, "text", "")
+            for block in (resp.content or [])
+            if getattr(block, "type", "") == "text" or hasattr(block, "text")
+        ).strip()
+
+        data = _safe_extract_json(text_out)
+
+        if isinstance(data, dict):
+            hotel_data  = data.get("hotel_data")  or {}
+            event_data  = data.get("event_data")  or {}
+            flight_data = data.get("flight_data") or {}
+            hotel_data.setdefault("hotels", [])
+            event_data.setdefault("events", [])
+            flight_data.setdefault("flights", [])
+            return {
+                "hotel_data": hotel_data,
+                "event_data": event_data,
+                "flight_data": flight_data,
+            }
+
+        # If Claude returned tool blocks but no final JSON, return {} to trigger your mock fallback
+        return {}
+    except Exception as e:
+        print("[Stage2 Claude] Error:", type(e).__name__, str(e))
+        return {}
+
+
+agent = Agent()
+
+
 # ---------- Helpers ----------
 def _create_text_msg(text: str, end_session: bool = False) -> ChatMessage:
     content = [TextContent(type="text", text=text)]
@@ -207,7 +225,7 @@ async def _ask_claude_for_json_async(system_prompt: str, user_prompt: str) -> An
     def _call():
         return anthropic_client.messages.create(
             model="claude-haiku-4-5",
-            max_tokens=2000,
+            max_tokens=200,
             temperature=0.1,
             system=system_prompt,
             messages=[{"role": "user", "content": user_prompt}],
