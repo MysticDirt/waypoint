@@ -1,305 +1,279 @@
 import os
 import json
-import asyncio
-import threading
-import re
-from datetime import datetime, timedelta
-from typing import List, Dict, Any, Optional
+import uuid  # Used to generate unique IDs
+import anthropic
+from serpapi import GoogleSearch
+from dotenv import load_dotenv
+from uagents import Agent, Context, Model
+from uagents.query import query
 
-from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+# --- 1. SETUP: LOAD API KEYS AND CLIENTS ---
 
-# ---- uAgents client that talks to your Hosted Agent (Agentverse) ----
-from uagents import Agent, Context, Protocol
-from uagents.setup import fund_agent_if_low  # ← keep funding helper
-from uagents_core.contrib.protocols.chat import (
-    ChatAcknowledgement,
-    ChatMessage,
-    EndSessionContent,
-    StartSessionContent,
-    TextContent,
-    chat_protocol_spec,
-)
+# Load variables from your .env file (api keys)
+load_dotenv()
 
-# ---------------- FastAPI app & CORS ----------------
-app = FastAPI()
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
+SERPAPI_API_KEY = os.environ.get("SERPAPI_API_KEY")
 
-# ---------------- Pydantic models ----------------
-class UserGoalRequest(BaseModel):
-    prompt: str
+if not ANTHROPIC_API_KEY:
+    raise ValueError("ANTHROPIC_API_KEY not found in .env file")
+if not SERPAPI_API_KEY:
+    raise ValueError("SERPAPI_API_KEY not found in .env file")
 
-class ItineraryItem(BaseModel):
-    id: str
-    title: str
-    description: str
-    startTime: str
-    type: str
+# Initialize the Anthropic (Claude) client
+claude_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
-class Location(BaseModel):
-    name: str
-    latitude: float
-    longitude: float
-    linkedItineraryId: str
 
-class AgentPlanResponse(BaseModel):
-    status: str
-    itinerary: List[ItineraryItem]
-    logs: List[str]
-    locations: List[Location]
+# --- 2. DATA MODELS: DEFINE AGENT'S INPUT/OUTPUT ---
 
-# ---------------- Config ----------------
-TARGET_AGENT_ADDRESS = os.getenv("TARGET_AGENT_ADDRESS", "").strip()  # Hosted Agent address (Agentverse)
-MAILBOX_EMAIL = os.getenv("MAILBOX_EMAIL", "").strip()                # optional (no longer needed for API)
-CLIENT_SEED = os.getenv("CLIENT_AGENT_SEED", "backend_client_seed_123")
+# This model defines the data we expect to receive from the backend
+class PlanRequest(Model):
+    prompt: str  # e.g., "Plan a cheap cultural weekend in Chicago"
 
-if not TARGET_AGENT_ADDRESS:
-    print("WARNING: TARGET_AGENT_ADDRESS is not set. Backend will use mock fallback.")
+# This model defines the final, structured data we will send back
+class AgentPlanResponse(Model):
+    status: str      # "success" or "error"
+    itinerary: list  # List of itinerary items
+    logs: list       # List of strings for debugging/showing thought process
+    locations: list  # List of location objects for the map
 
-# ---------------- Agentverse Bridge (client agent) ----------------
-class AgentverseBridge:
+
+# --- 3. REAL TOOLS: FUNCTIONS THAT CALL EXTERNAL APIS ---
+
+def search_real_hotels(query: str):
     """
-    Minimal client uAgent that sends Chat messages to your Hosted Agent (Agentverse)
-    and awaits a single reply. We serialize requests with a lock to keep it simple.
+    Searches SerpApi for real hotel data.
     """
-    def __init__(self, target_address: str):
-        self.target_address = target_address
-
-        # ✅ mailbox=True is all you need with current uAgents
-        self._agent = Agent(name="BackendClient", seed=CLIENT_SEED, mailbox=True)
-
-        self._protocol = Protocol(spec=chat_protocol_spec)
-        self._lock = asyncio.Lock()
-        self._loop = asyncio.new_event_loop()
-        self._thread: Optional[threading.Thread] = None
-        self._pending_future: Optional[asyncio.Future] = None
-
-        @self._protocol.on_message(ChatMessage)
-        async def on_msg(ctx: Context, sender: str, msg: ChatMessage):
-            if sender != self.target_address:
-                return
-            text = msg.text() or ""
-            fut = self._pending_future
-            if fut and not fut.done():
-                fut.set_result(text)
-
-        @self._protocol.on_message(ChatAcknowledgement)
-        async def on_ack(ctx: Context, sender: str, msg: ChatAcknowledgement):
-            pass
-
-        self._agent.include(self._protocol, publish_manifest=False)
-
-        # Optional faucet; safe to keep
-        try:
-            fund_agent_if_low(self._agent.wallet.address())
-        except Exception:
-            pass
-
-    def start(self):
-        if self._thread and self._thread.is_alive():
-            return
-        def run_loop():
-            asyncio.set_event_loop(self._loop)
-            self._agent.run()
-        self._thread = threading.Thread(target=run_loop, daemon=True)
-        self._thread.start()
-
-    async def send_and_wait(self, message_text: str, timeout: float = 25.0) -> str:
-        if not self.target_address:
-            raise RuntimeError("TARGET_AGENT_ADDRESS not configured.")
-        async with self._lock:
-            self.start()
-
-            def _mk_future():
-                return asyncio.run_coroutine_threadsafe(self._make_future(), self._loop).result()
-            self._pending_future = _mk_future()
-
-            start_session = ChatMessage(
-                timestamp=datetime.utcnow(),
-                msg_id=os.urandom(8).hex(),
-                content=[StartSessionContent(type="start-session")]
-            )
-            user_msg = ChatMessage(
-                timestamp=datetime.utcnow(),
-                msg_id=os.urandom(8).hex(),
-                content=[TextContent(type="text", text=message_text),
-                         EndSessionContent(type="end-session")]
-            )
-
-            def _send():
-                async def _do_send():
-                    await self._agent._context.send(self.target_address, start_session)
-                    await self._agent._context.send(self.target_address, user_msg)
-                return asyncio.run_coroutine_threadsafe(_do_send(), self._loop).result()
-            _send()
-
-            try:
-                result = await asyncio.wait_for(self._pending_future, timeout=timeout)
-                return result
-            except asyncio.TimeoutError:
-                raise TimeoutError("Timed out waiting for hosted agent response.")
-            finally:
-                self._pending_future = None
-
-    async def _make_future(self):
-        return asyncio.get_running_loop().create_future()
-
-# Create a global bridge
-bridge = AgentverseBridge(TARGET_AGENT_ADDRESS)
-
-# ---------------- Mock fallback (unchanged) ----------------
-def call_llm_api(system_prompt: str, user_prompt: str) -> Dict[str, Any]:
-    if "Respond ONLY with a JSON list of steps" in system_prompt:
-        return [
-            {"tool_name": "search_hotels", "parameters": {"location": "Chicago", "checkin": "2025-11-01", "checkout": "2025-11-03"}},
-            {"tool_name": "search_events", "parameters": {"location": "Chicago", "date": "2025-11-01"}},
-            {"tool_name": "search_flights", "parameters": {"from": "SFO", "to": "ORD", "date": "2025-11-01"}}
-        ]
-    elif "Synthesize it into an itinerary" in system_prompt:
-        base_time = datetime.now() + timedelta(days=7)
-        return {
-            "itinerary": [
-                {"id": "item_1", "title": "Flight to Chicago", "description": "Depart SFO→ORD", "startTime": (base_time+timedelta(hours=8)).isoformat(), "type": "travel"},
-                {"id": "item_2", "title": "Check-in at Budget Inn Chicago", "description": "Affordable downtown", "startTime": (base_time+timedelta(hours=14)).isoformat(), "type": "lodging"},
-                {"id": "item_3", "title": "Art Institute of Chicago", "description": "Free weekend admission", "startTime": (base_time+timedelta(days=1, hours=10)).isoformat(), "type": "activity"},
-                {"id": "item_4", "title": "Chicago Cultural Center", "description": "Free exhibitions", "startTime": (base_time+timedelta(days=1, hours=14)).isoformat(), "type": "activity"},
-                {"id": "item_5", "title": "Millennium Park Concert", "description": "Free outdoor concert", "startTime": (base_time+timedelta(days=1, hours=18)).isoformat(), "type": "activity"},
-            ],
-            "locations": [
-                {"name": "O'Hare International Airport", "latitude": 41.9742, "longitude": -87.9073, "linkedItineraryId": "item_1"},
-                {"name": "Budget Inn Chicago", "latitude": 41.8781, "longitude": -87.6298, "linkedItineraryId": "item_2"},
-                {"name": "Art Institute of Chicago", "latitude": 41.8796, "longitude": -87.6237, "linkedItineraryId": "item_3"},
-                {"name": "Chicago Cultural Center", "latitude": 41.8837, "longitude": -87.6249, "linkedItineraryId": "item_4"},
-                {"name": "Millennium Park", "latitude": 41.8826, "longitude": -87.6234, "linkedItineraryId": "item_5"},
-            ]
-        }
-    elif "Accept the changes" in system_prompt:
-        m = re.search(r'\{.*\}', user_prompt, re.DOTALL)
-        if m:
-            data = json.loads(m.group())
-            ids = {i["id"] for i in data.get("itinerary", [])}
-            locs = [l for l in data.get("locations", []) if l.get("linkedItineraryId") in ids]
-            return {"itinerary": data.get("itinerary", []), "locations": locs}
-        return {"itinerary": [], "locations": []}
-    return {}
-
-def mock_search_flights(from_city: str = "SFO", to_city: str = "ORD", date: str = "") -> Dict[str, Any]:
-    return {"flights":[
-        {"airline":"United","flight_number":"UA123","departure":from_city,"arrival":to_city,"price":250,"departure_time":"08:00","arrival_time":"14:00"},
-        {"airline":"Southwest","flight_number":"SW456","departure":from_city,"arrival":to_city,"price":180,"departure_time":"10:30","arrival_time":"16:30"},
-    ]}
-
-def mock_search_hotels(location: str = "Chicago", checkin: str = "", checkout: str = "") -> Dict[str, Any]:
-    return {"hotels":[
-        {"name":"Budget Inn Chicago","address":"123 Downtown St","price_per_night":75,"rating":4.2,"latitude":41.8781,"longitude":-87.6298},
-        {"name":"Chicago Hostel","address":"456 Loop Ave","price_per_night":35,"rating":4.5,"latitude":41.8850,"longitude":-87.6300},
-    ]}
-
-def mock_search_events(location: str = "Chicago", date: str = "") -> Dict[str, Any]:
-    return {"events":[
-        {"name":"Art Institute of Chicago","type":"museum","price":0,"description":"Free weekends","latitude":41.8796,"longitude":-87.6237},
-        {"name":"Chicago Cultural Center","type":"cultural","price":0,"description":"Free exhibitions","latitude":41.8837,"longitude":-87.6249},
-        {"name":"Millennium Park Concert","type":"concert","price":0,"description":"Free outdoor concert","latitude":41.8826,"longitude":-87.6234},
-    ]}
-
-# ---------------- Utils ----------------
-def _parse_agent_json(text: str) -> Dict[str, Any]:
-    m = re.search(r'(\{.*\}|\[.*\])', text, re.DOTALL)
-    if not m:
-        return {}
+    print(f"TOOL: Searching hotels for '{query}'")
     try:
-        return json.loads(m.group(1))
-    except Exception:
-        return {}
+        # Get today's and tomorrow's date for the search
+        from datetime import date, timedelta
+        today = date.today()
+        tomorrow = today + timedelta(days=1)
+        
+        params = {
+            "engine": "google_hotels",
+            "q": query,
+            "api_key": SERPAPI_API_KEY,
+            "check_in_date": today.strftime("%Y-%m-%d"),
+            "check_out_date": tomorrow.strftime("%Y-%m-%d"),
+            "currency": "USD"
+        }
+        search = GoogleSearch(params)
+        results = search.get_dict()
+        
+        # Get top 3 properties to avoid overwhelming the LLM
+        properties = results.get("properties", [])[:3]
+        
+        # Return the raw data as a JSON string
+        return json.dumps(properties)
+        
+    except Exception as e:
+        print(f"Error in search_real_hotels: {e}")
+        return json.dumps({"error": str(e)})
 
-# ---------------- FastAPI lifecycle ----------------
-@app.on_event("startup")
-async def _startup():
-    bridge.start()
+def search_real_events(query: str):
+    """
+    Searches SerpApi for real event data.
+    """
+    print(f"TOOL: Searching events for '{query}'")
+    try:
+        params = {
+            "engine": "google_events",
+            "q": query,
+            "api_key": SERPAPI_API_KEY,
+            "hl": "en",
+            "gl": "us"
+        }
+        search = GoogleSearch(params)
+        results = search.get_dict()
+        
+        # Get top 3 events
+        events = results.get("events_results", [])[:3]
+        
+        # Return the raw data as a JSON string
+        return json.dumps(events)
+        
+    except Exception as e:
+        print(f"Error in search_real_events: {e}")
+        return json.dumps({"error": str(e)})
 
-# ---------------- HTTP Endpoints ----------------
-@app.post("/plan", response_model=AgentPlanResponse)
-async def plan(request: UserGoalRequest):
-    logs: List[str] = []
-    goal = request.prompt.strip()
+# This dictionary maps the tool *name* (used by the LLM) to the *function*
+AVAILABLE_TOOLS = {
+    "search_hotels": search_real_hotels,
+    "search_events": search_real_events,
+}
 
-    if TARGET_AGENT_ADDRESS:
-        try:
-            reply_text = await bridge.send_and_wait(f"PLAN: {goal}", timeout=25.0)
-            data = _parse_agent_json(reply_text)
-            if isinstance(data, dict) and "itinerary" in data and "locations" in data:
-                logs.append("Hosted agent planning completed")
-                return AgentPlanResponse(
-                    status="success",
-                    itinerary=data.get("itinerary", []),
-                    logs=logs,
-                    locations=data.get("locations", [])
-                )
-            logs.append("Hosted agent returned unexpected structure; using mock fallback")
-        except Exception as e:
-            logs.append(f"Hosted agent error: {e}; using mock fallback")
 
-    # mock fallback
-    context = {
-        "hotel_data": mock_search_hotels(),
-        "event_data": mock_search_events(),
-        "flight_data": mock_search_flights(),
-    }
-    final_plan = call_llm_api(
-        "Synthesize it into an itinerary.",
-        f"Original Goal: {goal}\n\nCollected Data:\n{json.dumps(context)}"
-    )
-    logs.append("Mock planning completed")
-    return AgentPlanResponse(
-        status="success",
-        itinerary=final_plan.get("itinerary", []),
-        logs=logs,
-        locations=final_plan.get("locations", [])
-    )
+# --- 4. AGENT INITIALIZATION ---
 
-@app.post("/refine", response_model=AgentPlanResponse)
-async def refine(request: Dict[str, Any]):
-    logs: List[str] = []
-    payload = json.dumps(request)
+# Initialize your Fetch.ai uAgent
+agent = Agent(
+    name="proactive_life_manager_agent",
+    port=8001,
+    seed="my_cal_hacks_secret_seed_phrase" # Change this to a unique phrase
+)
 
-    if TARGET_AGENT_ADDRESS:
-        try:
-            reply_text = await bridge.send_and_wait(f"REFINE: {payload}", timeout=25.0)
-            data = _parse_agent_json(reply_text)
-            if isinstance(data, dict) and "itinerary" in data and "locations" in data:
-                logs.append("Hosted agent refinement completed")
-                return AgentPlanResponse(
-                    status="success",
-                    itinerary=data.get("itinerary", []),
-                    logs=logs,
-                    locations=data.get("locations", [])
-                )
-            logs.append("Hosted agent returned unexpected structure; using mock fallback")
-        except Exception as e:
-            logs.append(f"Hosted agent error: {e}; using mock fallback")
+@agent.on_event("startup")
+async def startup(ctx: Context):
+    ctx.logger.info("Agent started!")
+    ctx.logger.info("Waiting for planning requests...")
 
-    # mock fallback
-    refined = call_llm_api(
-        "Accept the changes and ensure consistency.",
-        f"Here is the user's modified plan:\n{payload}"
-    )
-    itinerary = request.get("itinerary", []) if refined.get("itinerary") == [] else refined.get("itinerary", request.get("itinerary", []))
-    ids = {i["id"] for i in itinerary}
-    locations = [l for l in request.get("locations", []) if l.get("linkedItineraryId") in ids]
-    logs.append("Mock refinement completed")
-    return AgentPlanResponse(status="success", itinerary=itinerary, logs=logs, locations=locations)
 
-@app.get("/health")
-async def health():
-    return {"status": "healthy", "service": "agent", "target_agent": bool(TARGET_AGENT_ADDRESS)}
+# --- 5. THE "BRAIN": AGENT'S MAIN LOGIC HANDLER ---
+
+@agent.on_rest_post("/plan", PlanRequest, AgentPlanResponse)
+async def handle_plan_request(ctx: Context, msg: PlanRequest) -> AgentPlanResponse:
+    """
+    This function is the main entry point.
+    It receives a prompt, creates a plan, executes tools, and synthesizes a result.
+    """
+    ctx.logger.info(f"Received planning request: '{msg.prompt}'")
+    
+    # --- CALL 1: (CLAUDE) Decompose Goal into a Tool Plan ---
+    
+    plan_system_prompt = f"""
+    You are a planning AI. A user has a goal. Your job is to
+    decompose that goal into a series of tool calls.
+    The tools you have available are:
+    {json.dumps(list(AVAILABLE_TOOLS.keys()), indent=2)}
+
+    Respond ONLY with a JSON list of dictionaries, in this exact format:
+    [
+        {{"tool_name": "name_of_tool", "query": "query_for_that_tool"}}
+    ]
+    """
+    
+    try:
+        ctx.logger.info("Calling Claude for step 1 (planning)...")
+        plan_message = claude_client.messages.create(
+            model="claude-3-5-haiku-20241022",  # Use Claude 3.5 Haiku for planning
+            max_tokens=1024,
+            system=plan_system_prompt,
+            messages=[
+                {"role": "user", "content": msg.prompt}
+            ]
+        )
+        plan_json_text = plan_message.content[0].text
+        ctx.logger.info(f"Claude's Plan: {plan_json_text}")
+        tool_plan = json.loads(plan_json_text)
+    except Exception as e:
+        ctx.logger.error(f"Error getting plan from Claude: {e}")
+        return AgentPlanResponse(status="error", itinerary=[], logs=[f"Error in planning phase: {e}"], locations=[])
+
+    # --- STEP 2: (AGENT) Execute the Tool Plan ---
+    
+    tool_results = []
+    execution_logs = [f"Original Goal: {msg.prompt}", f"Claude's plan: {plan_json_text}"]
+    
+    ctx.logger.info("Executing tool plan...")
+    for task in tool_plan:
+        tool_name = task.get("tool_name")
+        tool_query = task.get("query")
+        
+        if tool_name in AVAILABLE_TOOLS:
+            try:
+                # Call the actual tool function (e.g., search_real_hotels)
+                result_data = AVAILABLE_TOOLS[tool_name](tool_query)
+                tool_results.append({
+                    "tool": tool_name,
+                    "query": tool_query,
+                    "result": result_data
+                })
+                execution_logs.append(f"Successfully called {tool_name} with '{tool_query}'")
+            except Exception as e:
+                ctx.logger.error(f"Error executing tool {tool_name}: {e}")
+                tool_results.append({"tool": tool_name, "result": f"Error: {e}"})
+        else:
+            ctx.logger.warning(f"LLM tried to call unknown tool: '{tool_name}'")
+            execution_logs.append(f"Warning: Unknown tool '{tool_name}'")
+
+    # --- CALL 2: (CLAUDE) Synthesize Final Itinerary ---
+
+    synthesis_system_prompt = f"""
+    You are a 'Proactive Life Manager Agent'. Your job is to take a user's
+    original goal and a list of raw JSON tool results and synthesize them into
+    a complete, human-readable itinerary.
+
+    You MUST respond with a single JSON object that matches this structure:
+    {{
+      "status": "success",
+      "itinerary": [
+        {{
+          "id": "string (generate a unique uuid)",
+          "title": "string (e.g., 'Check into Hotel')",
+          "description": "string (e.g., 'Check into The Drake Hotel')",
+          "startTime": "string (ISO 8601 format, e.g., 2025-10-26T15:00:00)",
+          "type": "travel" | "lodging" | "activity"
+        }}
+      ],
+      "logs": ["string (a log of your thought process)"],
+      "locations": [
+        {{
+          "name": "string (e.g., 'The Drake Hotel')",
+          "latitude": "number (get from tool data, e.g., 'gps_coordinates.latitude')",
+          "longitude": "number (get from tool data, e.g., 'gps_coordinates.longitude')",
+          "linkedItineraryId": "string (must match one of the itinerary item ids you just generated)"
+        }}
+      ]
+    }}
+    
+    - Use the logs I provide as the basis for your own logs.
+    - Generate a new, unique ID for EACH itinerary item using a UUID.
+    - Be creative and make a logical, user-friendly plan.
+    - IMPORTANT: Extract latitude and longitude from the tool data. For hotels,
+      it's in `gps_coordinates.latitude`. For events, it might be in
+      `venue.gps_coordinates`. If it's missing, make your best estimate.
+    - The final response MUST be ONLY the JSON object, with no other text.
+    """
+    
+    synthesis_user_prompt = f"""
+    Original Goal: "{msg.prompt}"
+    
+    Tool Results (Raw JSON):
+    {json.dumps(tool_results, indent=2)}
+    
+    Execution Logs:
+    {json.dumps(execution_logs, indent=2)}
+
+    Now, generate the final AgentPlanResponse JSON.
+    """
+    
+    try:
+        ctx.logger.info("Calling Claude for step 2 (synthesis)...")
+        synthesis_message = claude_client.messages.create(
+            model="claude-3-5-haiku-20241022", # Use Claude 3.5 Haiku for synthesis
+            max_tokens=4096,
+            system=synthesis_system_prompt,
+            messages=[
+                {"role": "user", "content": synthesis_user_prompt}
+            ]
+        )
+        
+        final_plan_json_text = synthesis_message.content[0].text
+        
+        # Clean the response in case Claude wraps it in markdown
+        if "```json" in final_plan_json_text:
+             final_plan_json_text = final_plan_json_text.split("```json\n")[1].split("```")[0]
+        
+        ctx.logger.info("Successfully synthesized final plan.")
+        
+        final_plan_data = json.loads(final_plan_json_text)
+        
+        # --- Final Data Integrity Check ---
+        # Ensure all itinerary items have unique IDs
+        for item in final_plan_data.get("itinerary", []):
+            if "id" not in item or not item["id"]:
+                item["id"] = str(uuid.uuid4())
+        
+        # Return the successful response back to the backend
+        return AgentPlanResponse(**final_plan_data)
+        
+    except Exception as e:
+        ctx.logger.error(f"Error synthesizing final plan: {e}")
+        return AgentPlanResponse(status="error", itinerary=[], logs=[f"Error in synthesis phase: {e}"], locations=[])
+
+# --- 6. RUN THE AGENT ---
 
 if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="127.0.0.1", port=8001)
+    agent.run()
