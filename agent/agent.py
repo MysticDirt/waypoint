@@ -22,6 +22,9 @@ from uagents_core.contrib.protocols.chat import (
     chat_protocol_spec,
 )
 
+from dotenv import load_dotenv
+load_dotenv()
+
 # ---------------- FastAPI app & CORS ----------------
 app = FastAPI()
 app.add_middleware(
