@@ -102,6 +102,8 @@ async def asi_execute_steps(goal: str, steps: List[Dict[str, Any]]) -> Dict[str,
         "You are a data-gathering travel agent that can use web search and agent tools.\n"
         "Execute the given steps (search_hotels, search_events, search_flights) and return ONLY JSON with keys:\n"
         "  hotel_data, event_data, flight_data.\n"
+        "Search the internet for reliable sources (e.g., Google Flights, Ticketmaster, Hotels.com, official venues/airlines).\n"
+        "Plan only for the present or the future. Do not gather data from the past."
         "SCHEMAS (arrays may be empty, but keys must exist):\n"
         "- hotel_data.hotels[]: { name, address, price_per_night, rating, latitude, longitude }\n"
         "- event_data.events[]: { name, type, price, description, latitude, longitude }\n"
