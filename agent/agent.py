@@ -209,79 +209,105 @@ def search_real_hotels(query: str) -> str:
         print(f"Error in search_real_hotels: {e}")
         return json.dumps({"error": str(e)})
 
+# --- in your main agent file, replace search_real_events with:
+
 def search_real_events(query: str) -> str:
     """
-    Event search that defaults to the user's city from current_profile.
-    Adds SerpApi 'location' and post-filters to that city when possible.
+    Robust SerpApi events lookup with fallbacks:
+      A) google_events with location + ISO 'YYYY-MM-DD to YYYY-MM-DD' (when clean)
+      B) google_events with location only (dates pushed into q implicitly)
+      C) google web search fallback (Eventbrite/Ticketmaster/StubHub) normalized
+
+    Returns JSON string:
+      {"events": [ {title, description, start_date, end_date, start_time, end_time,
+                    venue:{name,address,latitude,longitude}, price, price_text, currency, link, source} ... ]}
+    or a clarifier:
+      {"error": "...", "user_prompt_needed": true, "suggested_questions": [...]}
     """
     print(f"TOOL: Searching events for '{query}'")
     try:
         import re
-        from datetime import timedelta
+        from datetime import datetime as _dt, timedelta
+        from serpapi import GoogleSearch
 
-        # Extract an explicit YYYY-MM-DD..YYYY-MM-DD range if present
-        range_text = None
-        m = re.search(r"(\d{4}-\d{2}-\d{2})\s*[\.\-–]+\s*(\d{4}-\d{2}-\d{2})", query)
-        if m:
-            range_text = f"{m.group(1)}..{m.group(2)}"
-
-        # Default event location is the user's city (e.g., "Berkeley, CA, USA")
-        default_location = current_profile.city or "United States"
-
-        params = {
-            "engine": "google_events",
-            "q": query,
-            "api_key": SERPAPI_API_KEY,
-            "hl": "en",
-            "gl": "us",
-            "location": default_location,   # <— use user's city as SerpApi location bias
+        # --- 0) Target city: prefer one mentioned in query; else user's city ---
+        CITY_CANON = {
+            "los angeles": "Los Angeles, CA", "san francisco": "San Francisco, CA",
+            "new york": "New York, NY", "seattle": "Seattle, WA", "boston": "Boston, MA",
+            "chicago": "Chicago, IL", "austin": "Austin, TX", "denver": "Denver, CO",
+            "miami": "Miami, FL", "las vegas": "Las Vegas, NV", "san diego": "San Diego, CA",
+            "portland": "Portland, OR", "phoenix": "Phoenix, AZ", "dallas": "Dallas, TX",
+            "houston": "Houston, TX", "atlanta": "Atlanta, GA", "washington": "Washington, DC",
+            "san jose": "San Jose, CA",
         }
-        if range_text:
-            params["date"] = range_text
+        qlow = query.lower()
+        target_city = None
+        for k, canon in CITY_CANON.items():
+            if k in qlow:
+                target_city = canon
+                break
+        if not target_city:
+            base = (current_profile.city or "United States").split(",")
+            target_city = base[0].strip()
+            if len(base) > 1:
+                target_city = f"{base[0].strip()}, {base[1].strip()}"
 
-        results = GoogleSearch(params).get_dict()
-        events = results.get("events_results", [])[:20]
+        # --- 1) Build date range as 'YYYY-MM-DD to YYYY-MM-DD' when clean ---
+        m_iso = re.search(r"(\d{4}-\d{2}-\d{2})\s*(?:\.\.|-|–|to)\s*(\d{4}-\d{2}-\d{2})", query)
+        date_range = None
+        if m_iso:
+            date_range = f"{m_iso.group(1)} to {m_iso.group(2)}"
+        else:
+            # Parse "Nov 21-23" / "November 21-23"
+            m_md = re.search(r"\b([A-Za-z]{3,9})\s+(\d{1,2})\s*[-–]\s*(\d{1,2})\b", query)
+            if m_md:
+                mon, d1, d2 = m_md.group(1), int(m_md.group(2)), int(m_md.group(3))
+                year = _dt.utcnow().year
+                try:
+                    start = _dt.strptime(f"{mon} {d1} {year}", "%b %d %Y")
+                except ValueError:
+                    start = _dt.strptime(f"{mon} {d1} {year}", "%B %d %Y")
+                if start < _dt.utcnow() - timedelta(days=30):
+                    year += 1
+                    try:
+                        start = _dt.strptime(f"{mon} {d1} {year}", "%b %d %Y")
+                    except ValueError:
+                        start = _dt.strptime(f"{mon} {d1} {year}", "%B %d %Y")
+                end = start.replace(day=d2)
+                date_range = f"{start.strftime('%Y-%m-%d')} to {end.strftime('%Y-%m-%d')}"
 
+        # --- helpers ---
         def add_year_if_missing(md: str | None) -> str | None:
             if not md:
                 return None
-            # Pass through full dates
             if re.match(r"^\d{4}-\d{2}-\d{2}$", md):
                 return md
-            # Try "Dec 19" -> current/next year
             try:
-                dt = datetime.strptime(md + f" {datetime.utcnow().year}", "%b %d %Y")
-                if dt < datetime.utcnow() - timedelta(days=30):
-                    dt = dt.replace(year=dt.year + 1)
-                return dt.strftime("%Y-%m-%d")
+                dt = _dt.strptime(md + f" {_dt.utcnow().year}", "%b %d %Y")
             except Exception:
-                return None
+                try:
+                    dt = _dt.strptime(md + f" {_dt.utcnow().year}", "%B %d %Y")
+                except Exception:
+                    return None
+            if dt < _dt.utcnow() - timedelta(days=30):
+                dt = dt.replace(year=dt.year + 1)
+            return dt.strftime("%Y-%m-%d")
 
         def parse_times(e):
-            d = e.get("date", {})
+            d = e.get("date", {}) or {}
             start_date = add_year_if_missing(d.get("start_date"))
             end_date = add_year_if_missing(d.get("end_date") or d.get("start_date"))
             start_time = d.get("start_time")
             end_time = d.get("end_time")
-            when = (d.get("when") or "") if isinstance(d, dict) else ""
+            when = d.get("when") or ""
             if not end_time and "–" in when:
                 mm = re.search(r"–\s*([0-9]{1,2}:[0-9]{2}\s*[AP]M)", when)
                 if mm:
                     end_time = mm.group(1)
             return start_date, end_date, start_time, end_time
 
-        # City-aware filter (match first token of city; tolerant)
-        city_token = (default_location.split(",")[0] or "").strip().lower()
-
-        def is_in_user_city(e):
-            v = e.get("venue") or {}
-            name = (v.get("name") or "").lower()
-            addr = (v.get("address") or "").lower()
-            blob = name + " " + addr
-            return (city_token and city_token in blob) or (default_location.lower() in blob)
-
         def parse_price(e):
-            tix = e.get("ticket_info", []) or []
+            tix = e.get("ticket_info") or []
             price_text, extracted, currency, link = None, None, None, None
             for t in tix:
                 price_text = price_text or t.get("price")
@@ -294,53 +320,103 @@ def search_real_events(query: str) -> str:
                     currency = {"$":"USD","€":"EUR","£":"GBP"}.get(symbol_or_ccy, symbol_or_ccy or "USD")
             return extracted, currency, price_text, link
 
-        normalized = []
-        for e in events:
-            # Keep only items that look like they're in/near the user's city
-            if not is_in_user_city(e):
-                continue
-            start_date, end_date, start_time, end_time = parse_times(e)
-            ex_price, ccy, price_text, ticket_link = parse_price(e)
-            venue = e.get("venue", {}) if isinstance(e.get("venue"), dict) else {}
-            coords = venue.get("gps_coordinates") or {}
+        def normalize(events_raw):
+            out = []
+            for ev in (events_raw or []):
+                if not isinstance(ev, dict):
+                    continue
+                # loosen city filtering: trust SerpApi's location bias
+                sd, ed, st, et = parse_times(ev)
+                ex_price, ccy, price_text, ticket_link = parse_price(ev)
+                venue = ev.get("venue") if isinstance(ev.get("venue"), dict) else {}
+                coords = (venue or {}).get("gps_coordinates") or {}
+                out.append({
+                    "title": ev.get("title"),
+                    "description": ev.get("description"),
+                    "start_date": sd, "end_date": ed,
+                    "start_time": st, "end_time": et,
+                    "venue": {
+                        "name": venue.get("name"),
+                        "address": venue.get("address"),
+                        "latitude": coords.get("latitude"),
+                        "longitude": coords.get("longitude"),
+                    },
+                    "price": ex_price, "price_text": price_text,
+                    "currency": ccy or "USD",
+                    "link": ticket_link or ev.get("link"),
+                    "source": ev.get("source") or "google_events",
+                })
+            # keep only items with a title + some date
+            return [n for n in out if n["title"] and n["start_date"]]
 
-            normalized.append({
-                "title": e.get("title"),
-                "description": e.get("description"),
-                "start_date": start_date,
-                "end_date": end_date,
-                "start_time": start_time,
-                "end_time": end_time,
-                "venue": {
-                    "name": venue.get("name"),
-                    "address": venue.get("address"),
-                    "latitude": coords.get("latitude"),
-                    "longitude": coords.get("longitude"),
-                },
-                "price": ex_price,
-                "price_text": price_text,
-                "currency": ccy or "USD",
-                "link": ticket_link or e.get("link"),
-                "source": e.get("source"),
-            })
+        # --- A) strict google_events (only if we have a clean ISO range) ---
+        base = {"engine": "google_events", "api_key": SERPAPI_API_KEY, "hl": "en", "gl": "us"}
+        strict = dict(base, q=query, location=target_city)
+        if date_range:
+            strict["date"] = date_range  # only add when clean
 
-        normalized = [n for n in normalized if n["title"] and n["start_date"]][:12]
-        if not normalized:
+        res = GoogleSearch(strict).get_dict()
+        events = normalize(res.get("events_results"))
+
+        # --- B) relaxed google_events (no explicit date; keep location; dates remain in q implicitly) ---
+        if not events:
+            relaxed = dict(base, q=query, location=target_city)
+            relaxed.pop("date", None)
+            res2 = GoogleSearch(relaxed).get_dict()
+            events = normalize(res2.get("events_results"))
+
+        # --- C) web fallback: ticketing sites ---
+        if not events:
+            date_for_q = ""
+            if date_range:
+                try:
+                    s, e = date_range.split(" to ")
+                    sd = _dt.strptime(s, "%Y-%m-%d").strftime("%b %d, %Y")
+                    ed = _dt.strptime(e, "%Y-%m-%d").strftime("%b %d, %Y")
+                    date_for_q = f" {sd} to {ed}"
+                except Exception:
+                    date_for_q = f" {date_range}"
+            web_q = f'{target_city} events{date_for_q} site:eventbrite.com OR site:ticketmaster.com OR site:stubhub.com'
+            web = {"engine": "google", "api_key": SERPAPI_API_KEY, "q": web_q, "hl": "en", "gl": "us", "num": "10"}
+            gres = GoogleSearch(web).get_dict()
+            organic = gres.get("organic_results", []) or []
+            norm2 = []
+            for r in organic:
+                if not isinstance(r, dict): 
+                    continue
+                title = r.get("title")
+                link = r.get("link")
+                snippet = r.get("snippet")
+                if title and link:
+                    norm2.append({
+                        "title": title,
+                        "description": snippet,
+                        "start_date": None, "end_date": None,
+                        "start_time": None, "end_time": None,
+                        "venue": {"name": None, "address": None, "latitude": None, "longitude": None},
+                        "price": None, "price_text": None, "currency": "USD",
+                        "link": link, "source": "web",
+                    })
+            events = norm2
+
+        events = events[:12]
+        if not events:
             return json.dumps({
-                "error": f"No events found near {default_location} for that query",
+                "error": f"No events found near {target_city}",
                 "user_prompt_needed": True,
                 "suggested_questions": [
-                    f"Should I broaden beyond {default_location}?",
-                    "Any specific neighborhoods or venues?",
-                    "Should I extend the date window by ±1 day?"
+                    f"Broaden beyond {target_city} or include nearby neighborhoods?",
+                    "Any specific event types (concerts, comedy, sports, museums)?",
+                    "Extend the date window by ±1 day?"
                 ]
             })
 
-        return json.dumps({"events": normalized})
+        return json.dumps({"events": events})
 
     except Exception as e:
         print(f"Error in search_real_events: {e}")
         return json.dumps({"error": str(e), "user_prompt_needed": True})
+
 
 def search_real_flights(query: str) -> str:
     """

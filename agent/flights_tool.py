@@ -55,25 +55,17 @@ def _parse_leg(seg: Dict[str, Any]) -> FlightLeg:
         layovers=[l.get("name") for l in _safe_dicts(seg.get("layovers"))],
     )
 
-# ---- replace these functions in flights_tool.py ----
+# --- in flights_tool.py ---
 
 def _pick_price(f: Dict[str, Any]) -> tuple[Optional[str], Optional[str]]:
-    """
-    Returns (total_price, currency) as strings when possible.
-    SerpApi variants observed: 
-      f["price"] = {"price": "129", "currency": "USD"}
-      f["price"] = {"amount": 129, "currency": "USD"}
-      f["price"] = "$129"
-    """
     p = f.get("price")
     if isinstance(p, dict):
-        price_val = p.get("price") or p.get("amount")
+        price_val = p.get("price") or p.get("amount") or p.get("display")
         if price_val is not None:
             return (str(price_val), p.get("currency"))
     if isinstance(p, (int, float)):
         return (str(p), None)
     if isinstance(p, str):
-        # "$129" -> ("129", "USD") best-effort
         import re
         m = re.search(r"([$\£\€])?\s*([0-9]+(?:\.[0-9]+)?)", p)
         if m:
@@ -81,47 +73,63 @@ def _pick_price(f: Dict[str, Any]) -> tuple[Optional[str], Optional[str]]:
             return (m.group(2), cur)
     return (None, None)
 
-
-def _coerce_time(val: Any) -> Optional[str]:
-    """
-    Accepts "3:15 PM", "15:15", "2025-11-21T15:15", unix ts, etc.
-    Returns a display string; you can keep it as-is (Claude will format).
-    """
-    if val is None:
-        return None
-    if isinstance(val, (int, float)):
-        # treat as unix seconds
-        from datetime import datetime
-        try:
-            return datetime.utcfromtimestamp(val).strftime("%Y-%m-%dT%H:%M:%S")
-        except Exception:
-            return None
-    # strings: just return, we don't enforce ISO here
-    return str(val)
-
-
 def _parse_leg_variant(seg: Dict[str, Any]) -> FlightLeg:
-    """
-    Normalizes across segment shapes:
-      - keys directly on segment
-      - nested: departure/arrival airport objects with 'code' or 'name'
-      - times in 'departure_time' / 'arrival_time' or nested 'time' fields
-    """
+    # Airline can appear as 'airline', or in 'carrier' obj, or in 'operating_carrier'
+    airline_name = (
+        seg.get("airline")
+        or (seg.get("carrier") or {}).get("name")
+        or (seg.get("carrier") or {}).get("airline")
+        or (seg.get("operating_carrier") or {}).get("name")
+    )
+    # Carrier/IATA codes:
+    airline_code = (
+        (seg.get("carrier") or {}).get("iata")
+        or (seg.get("operating_carrier") or {}).get("iata")
+        or (seg.get("carrier") or {}).get("code")
+        or None
+    )
+
+    # Flight number may be:
+    #  - 'flight_number'
+    #  - 'number'
+    #  - nested 'flight' { number / code }
+    fno = (
+        seg.get("flight_number")
+        or seg.get("number")
+        or (seg.get("flight") or {}).get("number")
+        or (seg.get("flight") or {}).get("code")
+    )
+    # Compose like "UA123" if we have an airline code + numeric number
+    flight_number = None
+    if fno:
+        fno_str = str(fno)
+        if airline_code and not fno_str.upper().startswith(airline_code):
+            flight_number = f"{airline_code}{fno_str}"
+        else:
+            flight_number = fno_str
+
     dep_air = seg.get("departure_airport") or seg.get("from") or seg.get("departure") or {}
-    arr_air = seg.get("arrival_airport") or seg.get("to") or seg.get("arrival") or {}
+    arr_air = seg.get("arrival_airport")   or seg.get("to")   or seg.get("arrival")   or {}
 
     def _code_or_name(x):
         if isinstance(x, dict):
             return x.get("code") or x.get("iata") or x.get("name")
         return x
 
-    airline = seg.get("airline") or (seg.get("carrier") or {}).get("name")
-    flight_no = seg.get("flight_number") or seg.get("number")
+    def _coerce_time(val: Any) -> Optional[str]:
+        if val is None:
+            return None
+        if isinstance(val, (int, float)):
+            from datetime import datetime
+            try:
+                return datetime.utcfromtimestamp(val).strftime("%Y-%m-%dT%H:%M:%S")
+            except Exception:
+                return None
+        return str(val)
 
     dep_time = _coerce_time(seg.get("departure_time") or seg.get("departure") or (dep_air.get("time") if isinstance(dep_air, dict) else None))
-    arr_time = _coerce_time(seg.get("arrival_time") or seg.get("arrival") or (arr_air.get("time") if isinstance(arr_air, dict) else None))
+    arr_time = _coerce_time(seg.get("arrival_time")   or seg.get("arrival")   or (arr_air.get("time") if isinstance(arr_air, dict) else None))
 
-    # duration could be minutes int or "2h 15m"
     duration = seg.get("duration")
     if isinstance(duration, (int, float)):
         duration = str(int(duration))
@@ -132,8 +140,8 @@ def _parse_leg_variant(seg: Dict[str, Any]) -> FlightLeg:
             layovers.append(l.get("name") or l.get("code"))
 
     return FlightLeg(
-        airline=airline,
-        flight_number=str(flight_no) if flight_no is not None else None,
+        airline=airline_name or airline_code,   # always fill at least something
+        flight_number=flight_number,
         duration=duration,
         departure_airport=_code_or_name(dep_air),
         departure_time=dep_time,
@@ -141,6 +149,7 @@ def _parse_leg_variant(seg: Dict[str, Any]) -> FlightLeg:
         arrival_time=arr_time,
         layovers=layovers,
     )
+
 
 
 def _extract_options(bucket: Dict[str, Any]) -> List[FlightOption]:
