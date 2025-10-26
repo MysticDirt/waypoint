@@ -495,7 +495,7 @@ function App() {
           <div className="bg-white shadow-sm border-b">
             <div className="p-6">
               <h1 className="text-3xl font-bold text-gray-900 mb-6">
-                Proactive Life Manager
+                Waypoint
               </h1>
               
               <form onSubmit={handleSubmit} className="space-y-4">
@@ -646,11 +646,12 @@ function App() {
                 </p>
                 
                 {/* Group options by type */}
-                {options.some(opt => opt.type === 'flight') && (
+                {/* Outbound Flights Section */}
+                {options.some(opt => opt.type === 'flight' && opt.category === 'outbound_flight') && (
                   <div className="mb-6">
-                    <h3 className="text-lg font-semibold text-gray-800 mb-3">✈️ Available Flights</h3>
+                    <h3 className="text-lg font-semibold text-gray-800 mb-3">✈️ Outbound Flights</h3>
                     <div className="space-y-3">
-                      {options.filter(opt => opt.type === 'flight').map((option) => {
+                      {options.filter(opt => opt.type === 'flight' && opt.category === 'outbound_flight').map((option) => {
                         // Debug: log the flight data structure
                         console.log('Flight option data:', option);
                         console.log('Title:', option.title);
@@ -786,6 +787,162 @@ function App() {
                             
                             <button
                               className="ml-4 px-4 py-2 bg-blue-600 text-white text-sm rounded-lg hover:bg-blue-700 transition-colors font-medium"
+                              onClick={(e) => {
+                                e.stopPropagation()
+                                handleSelectOption(option)
+                              }}
+                            >
+                              Select Flight
+                            </button>
+                          </div>
+                        </div>
+                        )
+                      })}
+                    </div>
+                  </div>
+                )}
+
+                {/* Return Flights Section */}
+                {options.some(opt => opt.type === 'flight' && opt.category === 'return_flight') && (
+                  <div className="mb-6">
+                    <h3 className="text-lg font-semibold text-gray-800 mb-3">🛬 Return Flights</h3>
+                    <div className="space-y-3">
+                      {options.filter(opt => opt.type === 'flight' && opt.category === 'return_flight').map((option) => {
+                        // Debug: log the flight data structure
+                        console.log('Flight option data:', option);
+                        console.log('Title:', option.title);
+                        console.log('Description:', option.description);
+                        console.log('legs_out:', option.data.legs_out);
+                        
+                        // Extract times from legs_out with fallbacks
+                        const legsOut = option.data.legs_out || [];
+                        let departureTime = null;
+                        let arrivalTime = null;
+                        
+                        if (legsOut.length > 0) {
+                          departureTime = legsOut[0].departure_time || legsOut[0].departure || null;
+                          arrivalTime = legsOut[legsOut.length - 1].arrival_time || legsOut[legsOut.length - 1].arrival || null;
+                          console.log('From legs_out:', { departureTime, arrivalTime });
+                        }
+                        
+                        // Filter out empty strings
+                        if (departureTime && typeof departureTime === 'string' && !departureTime.trim()) {
+                          departureTime = null;
+                        }
+                        if (arrivalTime && typeof arrivalTime === 'string' && !arrivalTime.trim()) {
+                          arrivalTime = null;
+                        }
+                        
+                        // Fallback to top-level fields if legs_out doesn't have times
+                        if (!departureTime) {
+                          departureTime = option.data.departure_time || option.data.departure_date || null;
+                        }
+                        if (!arrivalTime) {
+                          arrivalTime = option.data.arrival_time || option.data.arrival_date || null;
+                        }
+                        
+                        // Try to extract from description as last resort (format: "🕐 TIME → TIME")
+                        if (!departureTime && option.description) {
+                          const timeMatch = option.description.match(/🕐\s*([^→]+)/);
+                          if (timeMatch) {
+                            departureTime = timeMatch[1].trim();
+                            console.log('Extracted departure from description:', departureTime);
+                          }
+                        }
+                        if (!arrivalTime && option.description) {
+                          const timeMatch = option.description.match(/→\s*([^|]+)/);
+                          if (timeMatch) {
+                            arrivalTime = timeMatch[1].trim();
+                            console.log('Extracted arrival from description:', arrivalTime);
+                          }
+                        }
+                        
+                        console.log('Final extracted times:', { departureTime, arrivalTime });
+                        
+                        const departureAirport = legsOut.length > 0 ? legsOut[0].departure_airport : option.data.departure_airport;
+                        const arrivalAirport = legsOut.length > 0 ? legsOut[legsOut.length - 1].arrival_airport : option.data.arrival_airport;
+                        
+                        return (
+                        <div
+                          key={option.option_id}
+                          className="p-4 rounded-lg border-2 border-orange-200 bg-orange-50 hover:border-orange-400 hover:shadow-lg transition-all cursor-pointer"
+                          onClick={() => handleSelectOption(option)}
+                        >
+                          <div className="flex justify-between items-start">
+                            <div className="flex-1">
+                              <div className="flex items-center gap-2 mb-2">
+                                <span className="text-xl">🛬</span>
+                                <h3 className="font-bold text-lg text-orange-900">
+                                  {departureAirport?.code || departureAirport} → {arrivalAirport?.code || arrivalAirport}
+                                </h3>
+                                {option.data.total_price && (
+                                  <span className="px-3 py-1 text-sm rounded-full font-bold bg-green-100 text-green-800">
+                                    ${option.data.total_price} {option.data.currency || 'USD'}
+                                  </span>
+                                )}
+                              </div>
+                              
+                              {/* Title and Description - Always Show */}
+                              {option.title && (
+                                <div className="mb-2 text-sm font-medium text-orange-800">
+                                  {option.title}
+                                </div>
+                              )}
+                              
+                              {option.description && (
+                                <div className="mb-3 text-sm text-gray-700">
+                                  {option.description}
+                                </div>
+                              )}
+                              
+                              {/* Departure Time - Prominent if available */}
+                              {departureTime && departureTime.trim() && (
+                                <div className="mb-3 p-3 bg-white rounded-md border border-orange-300">
+                                  <div className="text-xs font-semibold text-orange-600 mb-1">DEPARTURE</div>
+                                  <div className="text-lg font-bold text-orange-900">
+                                    {formatTime(departureTime)}
+                                  </div>
+                                </div>
+                              )}
+                              
+                              {/* Flight Details Grid - Always Show Available Info */}
+                              <div className="grid grid-cols-2 gap-2 text-sm text-gray-700 mb-2">
+                                {legsOut.length > 0 && legsOut[0].airline && (
+                                  <p><span className="font-medium">Airline:</span> {legsOut[0].airline}</p>
+                                )}
+                                {legsOut.length > 0 && legsOut[0].flight_number && (
+                                  <p><span className="font-medium">Flight:</span> {legsOut[0].flight_number}</p>
+                                )}
+                                {option.data.out_duration && (
+                                  <p><span className="font-medium">Duration:</span> {Math.floor(option.data.out_duration / 60)}h {option.data.out_duration % 60}m</p>
+                                )}
+                                {arrivalTime && arrivalTime.trim() && (
+                                  <p><span className="font-medium">🕐 Arrives:</span> {formatTime(arrivalTime)}</p>
+                                )}
+                                {legsOut.length > 0 && legsOut[0].departure_time && (
+                                  <p><span className="font-medium">Departs:</span> {legsOut[0].departure_time}</p>
+                                )}
+                                {legsOut.length > 0 && legsOut[legsOut.length - 1].arrival_time && (
+                                  <p><span className="font-medium">Arrives:</span> {legsOut[legsOut.length - 1].arrival_time}</p>
+                                )}
+                              </div>
+                              
+                              {/* Show all legs if multiple */}
+                              {legsOut.length > 1 && (
+                                <div className="mt-2 p-2 bg-gray-50 rounded text-xs text-gray-600">
+                                  <p className="font-medium mb-1">{legsOut.length} flight segment(s):</p>
+                                  {legsOut.map((leg, idx) => (
+                                    <div key={idx} className="ml-2">
+                                      {idx + 1}. {leg.departure_airport} → {leg.arrival_airport}
+                                      {leg.departure_time && ` (${leg.departure_time})`}
+                                    </div>
+                                  ))}
+                                </div>
+                              )}
+                            </div>
+                            
+                            <button
+                              className="ml-4 px-4 py-2 bg-orange-600 text-white text-sm rounded-lg hover:bg-orange-700 transition-colors font-medium"
                               onClick={(e) => {
                                 e.stopPropagation()
                                 handleSelectOption(option)
