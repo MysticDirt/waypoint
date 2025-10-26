@@ -451,48 +451,35 @@ def search_real_events(query: str) -> str:
 
 def search_real_flights(query: str) -> str:
     """
-    Searches SerpApi (Google Flights) via find_flights and returns a compact JSON.
-    Robust against schema drift: only iterates lists of dicts, skips bad items.
+    Robust Google Flights normalizer for whatever find_flights(...) returns:
+      - list
+      - {"best":[...], "other":[...], ...}
+      - {"results": {"best":[...], ...}}
+      - raw SerpApi: {"best_flights":[...], "other_flights":[...]}
+    Always returns:
+      {
+        "query_parsed": {...},
+        "results": {"best":[...], "other":[...], "best_return":[...], "other_return":[...]}
+      }
     """
+    print("search_real_flights v3.1")
     print(f"TOOL: Searching flights for '{query}'")
     try:
-        import re
+        import re, json as _json, os
 
-        # --- Parse query ---
+        # ---------- Parse query ----------
         od_match = re.search(r"\b([A-Za-z]{3,}?)\b\s*(?:to|->|—|-)\s*\b([A-Za-z]{3,}?)\b", query, flags=re.IGNORECASE)
         origin = od_match.group(1).upper() if od_match else None
         destination = od_match.group(2).upper() if od_match else None
 
-        
-
-        date_matches = re.findall(r"\b(\d{4}-\d{2}-\d{2})\b", query)
-        depart_date = date_matches[0] if len(date_matches) >= 1 else None
-        return_date = date_matches[1] if len(date_matches) >= 2 else None
+        dates = re.findall(r"\b(\d{4}-\d{2}-\d{2})\b", query)
+        depart_date = dates[0] if len(dates) >= 1 else None
+        return_date = dates[1] if len(dates) >= 2 else None
 
         non_stop = bool(re.search(r"\bnon[-\s]?stop\b", query, flags=re.IGNORECASE))
 
-        # If ORIGIN missing, try user's home airport from profile city
         if not origin:
             origin = infer_home_airport(current_profile.city)
-
-        # If DEST is *clearly* a city name (not IATA) with spaces, you can let find_flights fail politely.
-        # (Optional: add your own city->IATA mapping for common destinations)
-
-        ...
-        if not origin or not destination or not depart_date:
-            # Build dynamic hints using the profile city if we inferred nothing
-            hints = [
-                "What cities or airports are you flying between?",
-                "What is your departure date in YYYY-MM-DD?",
-                "Do you need a return date?"
-            ]
-            if not origin and current_profile.city:
-                hints.insert(0, f"What's your preferred airport near {current_profile.city}?")
-            return json.dumps({
-                "error": "Missing origin/destination/depart_date",
-                "user_prompt_needed": True,
-                "suggested_questions": hints
-            })
 
         cabin_map = {
             "economy": "ECONOMY",
@@ -517,17 +504,20 @@ def search_real_flights(query: str) -> str:
             currency = m_ccy.group(1).upper()
 
         if not origin or not destination or not depart_date:
-            return json.dumps({
+            hints = [
+                "What cities or airports are you flying between?",
+                "What is your departure date in YYYY-MM-DD?",
+                "Do you need a return date?"
+            ]
+            if not origin and current_profile.city:
+                hints.insert(0, f"What's your preferred airport near {current_profile.city}?")
+            return _json.dumps({
                 "error": "Missing origin/destination/depart_date",
                 "user_prompt_needed": True,
-                "suggested_questions": [
-                    "What cities or airports are you flying between?",
-                    "What is your departure date in YYYY-MM-DD?",
-                    "Do you need a return date?"
-                ]
+                "suggested_questions": hints
             })
 
-        # --- Call wrapper ---
+        # ---------- Call wrapper ----------
         data = find_flights(
             origin=origin,
             destination=destination,
@@ -539,72 +529,183 @@ def search_real_flights(query: str) -> str:
             non_stop=non_stop,
         )
 
-        # --- Robust extraction helpers ---
-        def _as_list(x):
-            # Accept only lists; if dict with 'flights', use that; else empty
-            if isinstance(x, list):
-                return x
-            if isinstance(x, dict) and isinstance(x.get("flights"), list):
-                return x["flights"]
-            return []
-
-        def _safe_dicts(items):
-            # Keep only dict items
-            return [i for i in items if isinstance(i, dict)]
-
-        def shrink(bucket_like):
-            items = _safe_dicts(_as_list(bucket_like))[:3]
-            trimmed = []
-            for f in items:
-                # Defensive gets (all keys optional)
-                legs_out = []
-                for s in _safe_dicts(f.get("legs_out") or []):
-                    legs_out.append({
-                        "airline": s.get("airline"),
-                        "flight_number": s.get("flight_number"),
-                        "departure_airport": s.get("departure_airport"),
-                        "departure_time": s.get("departure_time"),
-                        "arrival_airport": s.get("arrival_airport"),
-                        "arrival_time": s.get("arrival_time"),
-                        "duration": s.get("duration"),
-                        "layovers": s.get("layovers") or [],
-                    })
-                booking_links = []
-                for bl in _safe_dicts(f.get("booking_links") or []):
-                    booking_links.append({
-                        "provider": bl.get("provider"),
-                        "link": bl.get("link"),
-                        "price": bl.get("price")
-                    })
-                trimmed.append({
-                    "title": f.get("title"),
-                    "total_price": f.get("total_price"),
-                    "currency": f.get("currency"),
-                    "out_duration": f.get("out_duration"),
-                    "ret_duration": f.get("ret_duration"),
-                    "legs_out": legs_out,
-                    "booking_links": booking_links[:2],
-                })
-            return trimmed
-
-        # Some environments accidentally serialize/deserialize the wrapper output;
-        # guard in case `data` is a JSON string.
+        # ---------- Defensive coercions ----------
+        # parse if JSON string
         if isinstance(data, str):
             try:
-                data = json.loads(data)
+                data = _json.loads(data)
             except Exception:
-                data = {}
+                data = []  # treat as empty
+
+        if os.environ.get("DEBUG_FLIGHTS") == "1":
+            print("[find_flights type]:", type(data).__name__)
+            if isinstance(data, dict):
+                print("[find_flights dict keys]:", list(data.keys())[:20])
+            elif isinstance(data, list) and data:
+                print("[find_flights list[0] type]:", type(data[0]).__name__)
+
+        # ---------- helpers ----------
+        def _lod(x):
+            return [i for i in x if isinstance(i, dict)] if isinstance(x, list) else []
+
+        def _coerce_results(x):
+            """
+            Return dict with keys: best, other, best_return, other_return (lists of dicts).
+            Never calls .get on a list.
+            """
+            best = []; other = []; best_ret = []; other_ret = []
+
+            if isinstance(x, list):
+                best = _lod(x)
+
+            elif isinstance(x, dict):
+                r = x.get("results")
+                if isinstance(r, dict):
+                    best      = _lod(r.get("best", []))
+                    other     = _lod(r.get("other", []))
+                    best_ret  = _lod(r.get("best_return", []))
+                    other_ret = _lod(r.get("other_return", []))
+                else:
+                    best      = _lod(x.get("best", []))
+                    other     = _lod(x.get("other", []))
+                    best_ret  = _lod(x.get("best_return", []))
+                    other_ret = _lod(x.get("other_return", []))
+                    if not any([best, other, best_ret, other_ret]):
+                        # raw SerpApi fallback
+                        best      = _lod(x.get("best_flights", []))
+                        other     = _lod(x.get("other_flights", []))
+                        best_ret  = _lod(x.get("best_return_flights", []))
+                        other_ret = _lod(x.get("other_return_flights", []))
+
+            return {
+                "best": best, "other": other,
+                "best_return": best_ret, "other_return": other_ret
+            }
+
+        def _parse_serpapi_legs(item):
+            if not isinstance(item, dict):
+                return []
+            legs = []
+            for seg in _lod(item.get("flights") or []):  # <-- your logs show 'flights'
+                dep = seg.get("departure_airport") or seg.get("from") or seg.get("departure") or {}
+                arr = seg.get("arrival_airport")   or seg.get("to")   or seg.get("arrival")   or {}
+
+                airline_name = (
+                    seg.get("airline") or
+                    (seg.get("carrier") or {}).get("name") or
+                    (seg.get("operating_carrier") or {}).get("name")
+                )
+                airline_code = (
+                    (seg.get("carrier") or {}).get("iata") or
+                    (seg.get("carrier") or {}).get("code") or
+                    (seg.get("operating_carrier") or {}).get("iata")
+                )
+                fno = seg.get("flight_number") or seg.get("number") or (seg.get("flight") or {}).get("number") or (seg.get("flight") or {}).get("code")
+                if fno:
+                    fno_str = str(fno)
+                    flight_number = f"{airline_code}{fno_str}" if (airline_code and not fno_str.upper().startswith(airline_code)) else fno_str
+                else:
+                    flight_number = None
+
+                def _code_or_name(xv):
+                    if isinstance(xv, dict):
+                        return xv.get("code") or xv.get("iata") or xv.get("name")
+                    return xv
+
+                dep_time = seg.get("departure_time") or (dep.get("time") if isinstance(dep, dict) else None)
+                arr_time = seg.get("arrival_time")   or (arr.get("time") if isinstance(arr, dict) else None)
+
+                duration = seg.get("duration")
+                if isinstance(duration, (int, float)):
+                    duration = str(int(duration))
+
+                layovers = []
+                for s in (seg.get("stops") or seg.get("layovers") or []):
+                    if isinstance(s, dict):
+                        layovers.append(s.get("name") or s.get("code"))
+                    else:
+                        layovers.append(str(s))
+
+                legs.append({
+                    "airline": airline_name or airline_code,
+                    "flight_number": flight_number,
+                    "departure_airport": _code_or_name(dep),
+                    "departure_time": str(dep_time) if dep_time else None,
+                    "arrival_airport": _code_or_name(arr),
+                    "arrival_time": str(arr_time) if arr_time else None,
+                    "duration": duration,
+                    "layovers": layovers,
+                })
+            return legs
+
+        def _shrink_item(f):
+            if not isinstance(f, dict):
+                return None
+
+            # price
+            price, ccy = None, None
+            p = f.get("price") or f.get("total_price")
+            if isinstance(p, dict):
+                price = str(p.get("price") or p.get("amount") or p.get("display") or "").strip() or None
+                ccy = p.get("currency")
+            elif isinstance(p, (int, float, str)):
+                price = str(p)
+
+            # durations
+            out_dur = f.get("out_duration") or f.get("total_duration")
+            ret_dur = f.get("ret_duration") or f.get("return_total_duration")
+            if isinstance(out_dur, (int, float)): out_dur = str(int(out_dur))
+            if isinstance(ret_dur, (int, float)): ret_dur = str(int(ret_dur))
+
+            # legs: prefer normalized legs_out; else parse SerpApi 'flights'
+            legs_out = _lod(f.get("legs_out") or [])
+            if not legs_out and isinstance(f.get("flights"), list):
+                legs_out = _parse_serpapi_legs(f)
+
+            # booking links
+            links = []
+            for bl in _lod(f.get("booking_links") or []):
+                links.append({
+                    "provider": bl.get("provider_name") or bl.get("provider") or bl.get("type"),
+                    "link": bl.get("link"),
+                    "price": str(bl.get("price")) if bl.get("price") is not None else None,
+                })
+
+            return {
+                "title": f.get("title") or f.get("type") or "Departing flight",
+                "total_price": price,
+                "currency": ccy or currency,
+                "out_duration": out_dur,
+                "ret_duration": ret_dur,
+                "legs_out": legs_out,
+                "booking_links": links[:2],
+            }
+
+        norm = _coerce_results(data)
+
+        # shrink to top 3 per bucket
+        def shrink(bucket):
+            out = []
+            for f in bucket[:3]:
+                item = _shrink_item(f)
+                if item:
+                    out.append(item)
+            return out
 
         results_obj = {
-            "best": shrink(data.get("best")),
-            "other": shrink(data.get("other")),
-            "best_return": shrink(data.get("best_return")),
-            "other_return": shrink(data.get("other_return")),
+            "best": shrink(norm["best"]),
+            "other": shrink(norm["other"]),
+            "best_return": shrink(norm["best_return"]),
+            "other_return": shrink(norm["other_return"]),
         }
 
-        # If truly empty, signal clarifications
+        if os.environ.get("DEBUG_FLIGHTS") == "1":
+            print("[normalized counts]:", {k: len(v) for k, v in results_obj.items()})
+            if norm["best"]:
+                print("[sample best keys]:", list(norm["best"][0].keys()))
+
         if not any(results_obj.values()):
-            return json.dumps({
+            return _json.dumps({
                 "error": "No flights found for the given parameters",
                 "user_prompt_needed": True,
                 "suggested_questions": [
@@ -624,7 +725,7 @@ def search_real_flights(query: str) -> str:
                 }
             })
 
-        return json.dumps({
+        return _json.dumps({
             "query_parsed": {
                 "origin": origin,
                 "destination": destination,
@@ -639,9 +740,13 @@ def search_real_flights(query: str) -> str:
         })
 
     except Exception as e:
-        # Never throw; always return JSON so the synthesizer can react.
+        import traceback
+        traceback.print_exc()
         print(f"Error in search_real_flights: {e}")
         return json.dumps({"error": str(e), "user_prompt_needed": True})
+
+
+
 
 AVAILABLE_TOOLS = {
     "search_hotels": search_real_hotels,
