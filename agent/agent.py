@@ -2,6 +2,7 @@ import os
 import json
 import uuid  # Used to generate unique IDs
 import anthropic
+from groq import Groq
 from serpapi import GoogleSearch
 from dotenv import load_dotenv
 from uagents import Agent, Context, Model
@@ -16,14 +17,20 @@ load_dotenv()
 
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 SERPAPI_API_KEY = os.environ.get("SERPAPI_API_KEY")
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 
 if not ANTHROPIC_API_KEY:
     raise ValueError("ANTHROPIC_API_KEY not found in .env file")
 if not SERPAPI_API_KEY:
     raise ValueError("SERPAPI_API_KEY not found in .env file")
+if not GROQ_API_KEY:
+    raise ValueError("GROQ_API_KEY not found in .env file")
 
 # Initialize the Anthropic (Claude) client
 claude_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+
+# Initialize the Groq client for fast refinement
+groq_client = Groq(api_key=GROQ_API_KEY)
 
 
 # --- 2. DATA MODELS: DEFINE AGENT'S INPUT/OUTPUT ---
@@ -39,12 +46,22 @@ class AgentPlanResponse(Model):
     logs: list       # List of strings for debugging/showing thought process
     locations: list  # List of location objects for the map
 
+# This model defines the data for refining an existing itinerary
+class RefineRequest(Model):
+    itinerary: list  # Current itinerary items (user may have edited)
+    locations: list  # Current location data
+
 
 # --- 3. REAL TOOLS: FUNCTIONS THAT CALL EXTERNAL APIS ---
 
 def search_real_hotels(query: str):
     """
     Searches SerpApi for real hotel data.
+    Now returns up to 8 hotels by default (increased from 3) to give users more options.
+    
+    Args:
+        query: Search query for hotels (e.g., "hotels in Chicago", "budget hotels Boston")
+        max_results: Maximum number of hotels to return (default: 8)
     """
     print(f"TOOL: Searching hotels for '{query}'")
     try:
@@ -77,6 +94,11 @@ def search_real_hotels(query: str):
 def search_real_events(query: str):
     """
     Searches SerpApi for real event data.
+    Now returns up to 10 events by default (increased from 3) to give users more options.
+    
+    Args:
+        query: Search query for events (e.g., "concerts in Chicago", "cultural events Boston")
+        max_results: Maximum number of events to return (default: 10, can go higher)
     """
     print(f"TOOL: Searching events for '{query}'")
     try:
@@ -264,6 +286,13 @@ async def handle_plan_request(ctx: Context, msg: PlanRequest) -> AgentPlanRespon
     decompose that goal into a series of tool calls.
     The tools you have available are:
     {json.dumps(list(AVAILABLE_TOOLS.keys()), indent=2)}
+    
+    IMPORTANT for search_flights:
+    - The query MUST include: origin city/airport, destination city/airport, and departure date in YYYY-MM-DD format
+    - Extract dates from natural language (e.g., "November 1st" -> "2025-11-01")
+    - If the user doesn't provide specific dates or locations, include what you can extract
+    - Format: "ORIGIN to DESTINATION depart YYYY-MM-DD return YYYY-MM-DD"
+    - Example: "New York to San Jose depart 2025-11-01 return 2025-11-03"
 
     Respond ONLY with a JSON list of dictionaries, in this exact format:
     [
@@ -321,6 +350,12 @@ async def handle_plan_request(ctx: Context, msg: PlanRequest) -> AgentPlanRespon
     You are a 'Proactive Life Manager Agent'. Your job is to take a user's
     original goal and a list of raw JSON tool results and synthesize them into
     a complete, human-readable itinerary.
+    
+    IMPORTANT: If any tool returns an error with "user_prompt_needed": true, you should:
+    1. Set status to "needs_clarification" instead of "success"
+    2. Include the suggested_questions in the logs for the user to see
+    3. Create a minimal itinerary with what you DO have
+    4. Clearly indicate in the logs what information is missing
 
     You MUST respond with a single JSON object that matches this structure:
     {{
@@ -348,6 +383,15 @@ async def handle_plan_request(ctx: Context, msg: PlanRequest) -> AgentPlanRespon
     - Use the logs I provide as the basis for your own logs.
     - Generate a new, unique ID for EACH itinerary item using a UUID.
     - Be creative and make a logical, user-friendly plan.
+    - IMPORTANT: When you receive multiple events from the search results, include them as "options"
+      in the itinerary item so users can choose which event they prefer.
+    - For events, create ONE itinerary item with multiple options listed in the "options" array.
+    - CRITICAL: Include ALL available details in the options array:
+      * For events: title, description, venue, time, date, ticket_info, link, price if available
+      * For hotels: name, description, price, currency, rating, reviews, amenities, link
+      * For flights: airline, price, duration, departure/arrival times, booking links
+    - The tool results contain enriched data with prices, ratings, and other details - USE THEM!
+    - Look for data in nested structures like "hotels", "events", "results" arrays in the tool output.
     - IMPORTANT: Extract latitude and longitude from the tool data. For hotels,
       it's in `gps_coordinates.latitude`. For events, it might be in
       `venue.gps_coordinates`. If it's missing, make your best estimate.
@@ -399,6 +443,122 @@ async def handle_plan_request(ctx: Context, msg: PlanRequest) -> AgentPlanRespon
     except Exception as e:
         ctx.logger.error(f"Error synthesizing final plan: {e}")
         return AgentPlanResponse(status="error", itinerary=[], logs=[f"Error in synthesis phase: {e}"], locations=[])
+
+
+# --- 5B. REFINEMENT HANDLER: USING GROQ FOR FAST ITERATION ---
+
+@agent.on_rest_post("/refine", RefineRequest, AgentPlanResponse)
+async def handle_refine_request(ctx: Context, msg: RefineRequest) -> AgentPlanResponse:
+    """
+    This function handles refinement of an existing itinerary.
+    It uses Groq's fast LLM inference to quickly update locations and validate the itinerary.
+    """
+    ctx.logger.info(f"Received refinement request with {len(msg.itinerary)} items")
+    
+    refinement_logs = [f"Refining itinerary with {len(msg.itinerary)} items"]
+    
+    # --- Use Groq for fast refinement ---
+    # Groq is ideal here because refinement needs to be quick and responsive
+    
+    refinement_prompt = f"""
+    You are refining a travel itinerary. The user has made changes to their plan.
+    Your job is to:
+    1. Validate the itinerary structure
+    2. Update or add missing location data (latitude/longitude) for any items
+    3. Ensure all itinerary items have proper IDs and are linked to locations
+    4. Add helpful suggestions in the logs
+    
+    Current Itinerary:
+    {json.dumps(msg.itinerary, indent=2)}
+    
+    Current Locations:
+    {json.dumps(msg.locations, indent=2)}
+    
+    You MUST respond with a single JSON object that matches this structure:
+    {{
+      "status": "success",
+      "itinerary": [
+        {{
+          "id": "string (preserve existing IDs or generate new UUIDs)",
+          "title": "string",
+          "description": "string",
+          "startTime": "string (ISO 8601 format)",
+          "type": "travel" | "lodging" | "activity"
+        }}
+      ],
+      "logs": ["string (your refinement notes and suggestions)"],
+      "locations": [
+        {{
+          "name": "string",
+          "latitude": "number",
+          "longitude": "number",
+          "linkedItineraryId": "string (must match an itinerary item id)"
+        }}
+      ]
+    }}
+    
+    Rules:
+    - Preserve user's edits and ordering
+    - If locations are missing coordinates, estimate reasonable values based on the location name
+    - Ensure every location has a valid linkedItineraryId
+    - Remove orphaned locations (locations without matching itinerary items)
+    - Add new locations for itinerary items that don't have them
+    - Respond ONLY with the JSON object, no other text
+    """
+    
+    try:
+        ctx.logger.info("Calling Groq for fast refinement...")
+        
+        # Use Groq's llama-3.3-70b-versatile for fast, high-quality refinement
+        completion = groq_client.chat.completions.create(
+            model="llama-3.3-70b-versatile",  # Fast and capable model
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You are a travel itinerary refinement assistant. Always respond with valid JSON only."
+                },
+                {
+                    "role": "user",
+                    "content": refinement_prompt
+                }
+            ],
+            temperature=0.3,  # Lower temperature for more consistent refinement
+            max_tokens=4096,
+        )
+        
+        refined_json_text = completion.choices[0].message.content
+        
+        # Clean the response in case it's wrapped in markdown
+        if "```json" in refined_json_text:
+            refined_json_text = refined_json_text.split("```json\n")[1].split("```")[0]
+        elif "```" in refined_json_text:
+            refined_json_text = refined_json_text.split("```")[1].split("```")[0]
+        
+        ctx.logger.info("Successfully refined itinerary with Groq.")
+        
+        refined_data = json.loads(refined_json_text)
+        
+        # --- Data Integrity Check ---
+        # Ensure all itinerary items have unique IDs
+        for item in refined_data.get("itinerary", []):
+            if "id" not in item or not item["id"]:
+                item["id"] = str(uuid.uuid4())
+        
+        # Add refinement log
+        refined_data.get("logs", []).insert(0, "Itinerary refined using Groq's fast inference")
+        
+        return AgentPlanResponse(**refined_data)
+        
+    except Exception as e:
+        ctx.logger.error(f"Error refining itinerary: {e}")
+        # On error, return the original data with error status
+        return AgentPlanResponse(
+            status="error",
+            itinerary=msg.itinerary,
+            logs=[f"Error in refinement: {e}"],
+            locations=msg.locations
+        )
+
 
 # --- 6. RUN THE AGENT ---
 

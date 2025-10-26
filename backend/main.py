@@ -21,6 +21,8 @@ app = FastAPI()
 origins = [
     "http://localhost:5173",  # Your frontend's address
     "http://127.0.0.1:5173",
+    "http://localhost:5174",  # Alternative frontend port
+    "http://127.0.0.1:5174",
 ]
 
 app.add_middleware(
@@ -48,6 +50,11 @@ class AgentPlanResponse(BaseModel):
 # This is the model *we send* to the agent
 class PlanRequest(BaseModel):
     prompt: str
+
+# This is the model for refining an existing itinerary
+class RefineRequest(BaseModel):
+    itinerary: list
+    locations: list
 
 
 # --- 5. API ENDPOINTS ---
@@ -98,8 +105,46 @@ async def create_plan(request: UserGoalRequest):
             locations=[]
         )
 
-# You can add your /refine endpoint here later,
-# following the same pattern as /plan
+@app.post("/refine", response_model=AgentPlanResponse)
+async def refine_plan(request: RefineRequest):
+    """
+    Receives an edited itinerary from the frontend and forwards it to the uAgent for refinement.
+    """
+    try:
+        print(f"Forwarding refinement request to agent with {len(request.itinerary)} items")
+        
+        # Send HTTP POST request to the agent's REST endpoint
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                f"{AGENT_URL}/refine",
+                json={"itinerary": request.itinerary, "locations": request.locations},
+                timeout=180.0  # Give the agent 3 minutes to run
+            )
+            
+            print(f"Response status: {response.status_code}")
+            
+            if response.status_code == 200:
+                response_data = response.json()
+                print("Received successful refinement from agent.")
+                return AgentPlanResponse(**response_data)
+            else:
+                error_msg = f"Agent returned status {response.status_code}: {response.text}"
+                print(error_msg)
+                return AgentPlanResponse(
+                    status="error",
+                    logs=[error_msg],
+                    itinerary=request.itinerary,  # Return original itinerary on error
+                    locations=request.locations
+                )
+
+    except Exception as e:
+        print(f"Error querying agent for refinement: {e}")
+        return AgentPlanResponse(
+            status="error",
+            logs=[f"Failed to reach agent or agent timed out: {e}"],
+            itinerary=request.itinerary,  # Return original itinerary on error
+            locations=request.locations
+        )
 
 
 # --- 6. RUN THE SERVER ---
