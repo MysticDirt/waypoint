@@ -771,41 +771,122 @@ def _parse_iso(s: Optional[str]):
     except Exception:
         return None
 
-def _conflicts(a: Dict[str, Any], b: Dict[str, Any], buffer_minutes=30) -> bool:
-    sa, ea = _parse_iso(a.get("startTime")), _parse_iso(a.get("endTime"))
-    sb, eb = _parse_iso(b.get("startTime")), _parse_iso(b.get("endTime"))
-    if not sa or not sb:
-        return False
-    if not ea: ea = sa + timedelta(minutes=90)
-    if not eb: eb = sb + timedelta(minutes=90)
-    # Apply buffer
-    ea = ea + timedelta(minutes=buffer_minutes)
-    sb = sb - timedelta(minutes=buffer_minutes)
-    return sa < eb and sb < ea
+# Conflict checking disabled - events will not be removed due to time overlaps
+# def _conflicts(a: Dict[str, Any], b: Dict[str, Any], buffer_minutes=30) -> bool:
+#     sa, ea = _parse_iso(a.get("startTime")), _parse_iso(a.get("endTime"))
+#     sb, eb = _parse_iso(b.get("startTime")), _parse_iso(b.get("endTime"))
+#     if not sa or not sb:
+#         return False
+#     if not ea: ea = sa + timedelta(minutes=90)
+#     if not eb: eb = sb + timedelta(minutes=90)
+#     # Apply buffer
+#     ea = ea + timedelta(minutes=buffer_minutes)
+#     sb = sb - timedelta(minutes=buffer_minutes)
+#     return sa < eb and sb < ea
 
-def enforce_no_overlaps(plan: Dict[str, Any]) -> Dict[str, Any]:
-    items = plan.get("itinerary", [])
-    logs = plan.get("logs", [])
-    if not isinstance(logs, list):
-        logs = []
-        plan["logs"] = logs
+# def enforce_no_overlaps(plan: Dict[str, Any]) -> Dict[str, Any]:
+#     items = plan.get("itinerary", [])
+#     logs = plan.get("logs", [])
+#     if not isinstance(logs, list):
+#         logs = []
+#         plan["logs"] = logs
 
-    def keyfn(x: Dict[str, Any]):
-        t = _parse_iso(x.get("startTime"))
-        return t or datetime.max
+#     def keyfn(x: Dict[str, Any]):
+#         t = _parse_iso(x.get("startTime"))
+#         return t or datetime.max
 
-    items.sort(key=keyfn)
-    kept, removed = [], []
-    for item in items:
-        if any(_conflicts(item, k, buffer_minutes=30) for k in kept):
-            removed.append(item)
+#     items.sort(key=keyfn)
+#     kept, removed = [], []
+#     for item in items:
+#         if any(_conflicts(item, k, buffer_minutes=30) for k in kept):
+#             removed.append(item)
+#         else:
+#             kept.append(item)
+#     if removed:
+#         plan["itinerary"] = kept
+#         for r in removed:
+#             logs.append(f"conflict_removed: '{r.get('title')}' at {r.get('startTime')}")
+#     return plan
+
+def _event_to_time_comparable(event_data: Dict[str, Any]) -> Dict[str, Any]:
+    """Convert event data structure to format compatible with _conflicts checker."""
+    start_date = event_data.get("start_date", "")
+    start_time = event_data.get("start_time", "")
+    end_date = event_data.get("end_date", "") or start_date
+    end_time = event_data.get("end_time", "")
+    
+    # Construct ISO-like datetime strings
+    start_iso = None
+    end_iso = None
+    
+    if start_date:
+        if start_time:
+            # Parse time like "7:00 PM" or "19:00"
+            try:
+                from datetime import datetime as _dt
+                time_str = start_time.strip()
+                if "AM" in time_str.upper() or "PM" in time_str.upper():
+                    dt = _dt.strptime(f"{start_date} {time_str}", "%Y-%m-%d %I:%M %p")
+                else:
+                    dt = _dt.strptime(f"{start_date} {time_str}", "%Y-%m-%d %H:%M")
+                start_iso = dt.strftime("%Y-%m-%dT%H:%M:%S")
+            except:
+                # Fallback to just date with default time
+                start_iso = f"{start_date}T12:00:00"
         else:
-            kept.append(item)
-    if removed:
-        plan["itinerary"] = kept
-        for r in removed:
-            logs.append(f"conflict_removed: '{r.get('title')}' at {r.get('startTime')}")
-    return plan
+            start_iso = f"{start_date}T12:00:00"
+    
+    if end_date:
+        if end_time:
+            try:
+                from datetime import datetime as _dt
+                time_str = end_time.strip()
+                if "AM" in time_str.upper() or "PM" in time_str.upper():
+                    dt = _dt.strptime(f"{end_date} {time_str}", "%Y-%m-%d %I:%M %p")
+                else:
+                    dt = _dt.strptime(f"{end_date} {time_str}", "%Y-%m-%d %H:%M")
+                end_iso = dt.strftime("%Y-%m-%dT%H:%M:%S")
+            except:
+                # Fallback
+                end_iso = None
+        else:
+            end_iso = None
+    
+    return {"startTime": start_iso, "endTime": end_iso}
+
+# Conflict checking disabled - event options will not be filtered
+# def remove_conflicting_event_options(options: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+#     """Remove event options that have time conflicts with each other, keeping earlier events."""
+#     event_options = [opt for opt in options if opt.get("type") == "event"]
+#     non_event_options = [opt for opt in options if opt.get("type") != "event"]
+    
+#     if not event_options:
+#         return options
+    
+#     # Convert events to time-comparable format and sort by start time
+#     events_with_times = []
+#     for opt in event_options:
+#         event_data = opt.get("data", {})
+#         time_data = _event_to_time_comparable(event_data)
+#         if time_data.get("startTime"):
+#             events_with_times.append((opt, time_data))
+    
+#     # Sort by start time
+#     events_with_times.sort(key=lambda x: x[1].get("startTime") or "9999-12-31T23:59:59")
+    
+#     # Filter out conflicts
+#     kept = []
+#     for opt, time_data in events_with_times:
+#         has_conflict = False
+#         for kept_opt, kept_time in kept:
+#             if _conflicts(time_data, kept_time, buffer_minutes=30):
+#                 has_conflict = True
+#                 break
+#         if not has_conflict:
+#             kept.append((opt, time_data))
+    
+#     # Return kept events plus all non-event options
+#     return [opt for opt, _ in kept] + non_event_options
 
 def ensure_ids(plan: Dict[str, Any]) -> Dict[str, Any]:
     for item in plan.get("itinerary", []):
@@ -1155,26 +1236,132 @@ Respond with JSON only (no fences, no prose).
         )
         final_plan = safe_json_from_prefill_object(synth_msg.content[0].text)
 
-        # Server-side safety: ensure IDs and remove overlaps
+        # Server-side safety: ensure IDs (overlap checking disabled)
         final_plan = ensure_ids(final_plan)
-        final_plan = enforce_no_overlaps(final_plan)
+        # final_plan = enforce_no_overlaps(final_plan)  # Disabled - keeping all events
         
         # Extract options from tool results if not already in final_plan
         if not final_plan.get("options"):
             final_plan["options"] = []
         
-        # Extract ALL flight options
+        # Check if user has outbound flight but no return flight - if so, search for return flights
+        has_outbound = any(item.get('type') == 'travel' and 'departure' in item.get('title', '').lower() for item in msg.itinerary)
+        has_return_options = any(opt.get('category') == 'return_flight' for opt in final_plan.get('options', []))
+        
+        if has_outbound and not has_return_options:
+            # Try to extract return flight search parameters from trip context or itinerary
+            try:
+                # Find the outbound flight in itinerary to get origin/destination
+                outbound_flight = None
+                for item in msg.itinerary:
+                    if item.get('type') == 'travel' and 'departure' in item.get('title', '').lower():
+                        outbound_flight = item
+                        break
+                
+                if outbound_flight:
+                    # Extract details from the outbound flight
+                    flight_details = outbound_flight.get('details', {}).get('flight', {})
+                    origin = flight_details.get('arrival_airport', '')
+                    destination = flight_details.get('departure_airport', '')
+                    
+                    # Try to infer return date from trip context or use a reasonable default
+                    import re
+                    return_date = None
+                    
+                    # Look for dates in trip context
+                    date_matches = re.findall(r'\b(\d{4}-\d{2}-\d{2})\b', trip_context)
+                    if len(date_matches) >= 2:
+                        return_date = date_matches[-1]  # Use the last date as return
+                    elif date_matches:
+                        # Add 3 days to the departure date as default
+                        try:
+                            depart = datetime.fromisoformat(date_matches[0])
+                            return_dt = depart + timedelta(days=3)
+                            return_date = return_dt.strftime('%Y-%m-%d')
+                        except:
+                            pass
+                    
+                    if origin and destination and return_date:
+                        logs.append(f"🔍 Searching for return flights from {origin} to {destination} on {return_date}...")
+                        
+                        # Search for return flights
+                        return_query = f"{origin} to {destination} depart {return_date}"
+                        try:
+                            return_result = search_real_flights(return_query)
+                            return_data = json.loads(return_result)
+                            return_results = return_data.get("results", {})
+                            
+                            # Get all return flights from the search
+                            all_return_flights = []
+                            all_return_flights.extend(return_results.get("best", []))
+                            all_return_flights.extend(return_results.get("other", []))
+                            
+                            # Add them as return flight options
+                            for i, flight in enumerate(all_return_flights):
+                                if flight.get("total_price"):
+                                    duration_min = flight.get('out_duration', 0)
+                                    hours = duration_min // 60
+                                    mins = duration_min % 60
+                                    
+                                    legs_out = flight.get('legs_out', [])
+                                    departure_time = ""
+                                    arrival_time = ""
+                                    if legs_out and len(legs_out) > 0:
+                                        first_leg = legs_out[0]
+                                        departure_time = first_leg.get('departure_time', '')
+                                        last_leg = legs_out[-1]
+                                        arrival_time = last_leg.get('arrival_time', '')
+                                    
+                                    title_parts = []
+                                    if departure_time:
+                                        title_parts.append(f"Returns {departure_time}")
+                                    title_parts.append(f"${flight.get('total_price')}")
+                                    title_parts.append(f"{hours}h {mins}m")
+                                    title = " • ".join(title_parts)
+                                    
+                                    desc_parts = []
+                                    if departure_time and arrival_time:
+                                        desc_parts.append(f"🕐 {departure_time} → {arrival_time}")
+                                    desc_parts.append(f"⏱️ Duration: {hours}h {mins}m")
+                                    desc_parts.append(f"💵 Price: ${flight.get('total_price')} {flight.get('currency', 'USD')}")
+                                    description = " | ".join(desc_parts)
+                                    
+                                    final_plan["options"].append({
+                                        "option_id": f"return_flight_{i}_{uuid.uuid4().hex[:8]}",
+                                        "type": "flight",
+                                        "category": "return_flight",
+                                        "title": title,
+                                        "description": description,
+                                        "data": flight,
+                                        "replaces_itinerary_id": None
+                                    })
+                            
+                            if all_return_flights:
+                                logs.append(f"✨ Found {len(all_return_flights)} return flight options for you!")
+                            else:
+                                logs.append("⚠️ No return flights found. Try specifying a return date.")
+                        except Exception as e:
+                            logs.append(f"Error searching return flights: {e}")
+            except Exception as e:
+                logs.append(f"Error detecting outbound flight details: {e}")
+        
+        # Extract ALL flight options (outbound and return)
         for result in tool_results:
             if result.get("tool") == "search_flights":
                 try:
                     flight_data = json.loads(result.get("result", "{}"))
-                    # Get both 'best' and 'other' flights
-                    all_flights = []
                     results = flight_data.get("results", {})
-                    all_flights.extend(results.get("best", []))
-                    all_flights.extend(results.get("other", []))
                     
-                    for i, flight in enumerate(all_flights):  # ALL flights
+                    print(f"DEBUG: Flight search results keys: {results.keys()}")
+                    print(f"DEBUG: best_return count: {len(results.get('best_return', []))}")
+                    print(f"DEBUG: other_return count: {len(results.get('other_return', []))}")
+                    
+                    # Get both 'best' and 'other' OUTBOUND flights
+                    all_outbound_flights = []
+                    all_outbound_flights.extend(results.get("best", []))
+                    all_outbound_flights.extend(results.get("other", []))
+                    
+                    for i, flight in enumerate(all_outbound_flights):  # ALL outbound flights
                         if flight.get("total_price"):
                             duration_min = flight.get('out_duration', 0)
                             hours = duration_min // 60
@@ -1208,7 +1395,7 @@ Respond with JSON only (no fences, no prose).
                             description = " | ".join(desc_parts)
                             
                             final_plan["options"].append({
-                                "option_id": f"flight_option_{i}_{uuid.uuid4().hex[:8]}",
+                                "option_id": f"outbound_flight_{i}_{uuid.uuid4().hex[:8]}",
                                 "type": "flight",
                                 "category": "outbound_flight",
                                 "title": title,
@@ -1216,6 +1403,60 @@ Respond with JSON only (no fences, no prose).
                                 "data": flight,
                                 "replaces_itinerary_id": None
                             })
+                    
+                    # Get both 'best_return' and 'other_return' RETURN flights
+                    all_return_flights = []
+                    all_return_flights.extend(results.get("best_return", []))
+                    all_return_flights.extend(results.get("other_return", []))
+                    
+                    print(f"DEBUG: Total return flights to process: {len(all_return_flights)}")
+                    
+                    for i, flight in enumerate(all_return_flights):  # ALL return flights
+                        print(f"DEBUG: Processing return flight {i}: has total_price={flight.get('total_price')}")
+                        if flight.get("total_price"):
+                            duration_min = flight.get('out_duration', 0) or flight.get('ret_duration', 0)
+                            hours = duration_min // 60
+                            mins = duration_min % 60
+                            
+                            # Extract departure date/time from first leg
+                            departure_time = ""
+                            arrival_time = ""
+                            legs_out = flight.get('legs_out', [])
+                            if legs_out and len(legs_out) > 0:
+                                first_leg = legs_out[0]
+                                departure_time = first_leg.get('departure_time', '')
+                                # Get arrival time from last leg for end-to-end time
+                                last_leg = legs_out[-1]
+                                arrival_time = last_leg.get('arrival_time', '')
+                            
+                            # Build enhanced title with time for return flight
+                            title_parts = []
+                            if departure_time:
+                                title_parts.append(f"Returns {departure_time}")
+                            title_parts.append(f"${flight.get('total_price')}")
+                            title_parts.append(f"{hours}h {mins}m")
+                            title = " • ".join(title_parts)
+                            
+                            # Build enhanced description
+                            desc_parts = []
+                            if departure_time and arrival_time:
+                                desc_parts.append(f"🕐 {departure_time} → {arrival_time}")
+                            desc_parts.append(f"⏱️ Duration: {hours}h {mins}m")
+                            desc_parts.append(f"💵 Price: ${flight.get('total_price')} {flight.get('currency', 'USD')}")
+                            description = " | ".join(desc_parts)
+                            
+                            return_flight_option = {
+                                "option_id": f"return_flight_{i}_{uuid.uuid4().hex[:8]}",
+                                "type": "flight",
+                                "category": "return_flight",
+                                "title": title,
+                                "description": description,
+                                "data": flight,
+                                "replaces_itinerary_id": None
+                            }
+                            final_plan["options"].append(return_flight_option)
+                            print(f"DEBUG: Added return flight option {i}: {title}")
+                    
                 except Exception as e:
                     logs.append(f"Error extracting flight options: {e}")
         
@@ -1260,6 +1501,13 @@ Respond with JSON only (no fences, no prose).
         # Update logs if options were added
         options_count = len(final_plan.get("options", []))
         print(f"DEBUG: Extracted {options_count} total options")
+        
+        # Count options by category
+        outbound_count = sum(1 for opt in final_plan.get("options", []) if opt.get("category") == "outbound_flight")
+        return_count = sum(1 for opt in final_plan.get("options", []) if opt.get("category") == "return_flight")
+        event_count = sum(1 for opt in final_plan.get("options", []) if opt.get("type") == "event")
+        print(f"DEBUG: Options breakdown - Outbound: {outbound_count}, Return: {return_count}, Events: {event_count}")
+        
         if final_plan.get("options"):
             final_plan["logs"] = final_plan.get("logs", []) + [
                 f"\n✨ Found {len(final_plan['options'])} alternative options for you to choose from!"
@@ -1359,7 +1607,7 @@ Rules:
         refined_data["logs"] = logs
 
         # Server-side safety: remove overlaps
-        refined_data = enforce_no_overlaps(refined_data)
+        #refined_data = enforce_no_overlaps(refined_data)
 
         return AgentPlanResponse(**refined_data)
 
