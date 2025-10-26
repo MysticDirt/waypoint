@@ -1,8 +1,9 @@
 import uvicorn
 import httpx
 from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware  # Import CORS
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from typing import List, Dict
 
 # --- 1. AGENT CONFIGURATION ---
 
@@ -34,27 +35,26 @@ app.add_middleware(
 )
 
 
-# --- 4. DATA MODELS (from your README) ---
-# These models must match the models in your agent.py file
+# --- 4. DATA MODELS ---
+# These models match the Fetch.ai agent models
 
 class UserGoalRequest(BaseModel):
     prompt: str
 
-# This is the model *we expect back* from the agent
 class AgentPlanResponse(BaseModel):
     status: str
-    itinerary: list
-    logs: list
-    locations: list
+    itinerary: List[Dict]
+    flights: List[Dict]  # New: flight data
+    events: List[Dict]   # New: event data
+    logs: List[str]
+    locations: List[Dict]
     
-# This is the model *we send* to the agent
 class PlanRequest(BaseModel):
     prompt: str
 
-# This is the model for refining an existing itinerary
 class RefineRequest(BaseModel):
-    itinerary: list
-    locations: list
+    itinerary: List[Dict]
+    locations: List[Dict]
 
 
 # --- 5. API ENDPOINTS ---
@@ -67,24 +67,27 @@ async def health_check():
 @app.post("/plan", response_model=AgentPlanResponse)
 async def create_plan(request: UserGoalRequest):
     """
-    Receives the goal from the frontend and forwards it to the uAgent.
+    Receives the goal from the frontend and forwards it to the Fetch.ai orchestrator agent.
+    The orchestrator coordinates with flight_agent and event_agent using Fetch.ai's multi-agent system.
     """
     try:
-        print(f"Forwarding request to agent: {request.prompt}")
+        print(f"Forwarding request to orchestrator agent: {request.prompt}")
         
-        # Send HTTP POST request to the agent's REST endpoint
+        # Send HTTP POST request to the orchestrator agent's REST endpoint
         async with httpx.AsyncClient() as client:
             response = await client.post(
                 f"{AGENT_URL}/plan",
                 json={"prompt": request.prompt},
-                timeout=180.0  # Give the agent 3 minutes to run (Claude + SerpApi can be slow)
+                timeout=180.0  # Give agents time to coordinate (Groq + Claude + data fetching)
             )
             
             print(f"Response status: {response.status_code}")
             
             if response.status_code == 200:
                 response_data = response.json()
-                print("Received successful plan from agent.")
+                print("Received successful plan from orchestrator.")
+                print(f"Flights found: {len(response_data.get('flights', []))}")
+                print(f"Events found: {len(response_data.get('events', []))}")
                 return AgentPlanResponse(**response_data)
             else:
                 error_msg = f"Agent returned status {response.status_code}: {response.text}"
@@ -93,39 +96,43 @@ async def create_plan(request: UserGoalRequest):
                     status="error",
                     logs=[error_msg],
                     itinerary=[],
+                    flights=[],
+                    events=[],
                     locations=[]
                 )
 
     except Exception as e:
-        print(f"Error querying agent: {e}")
+        print(f"Error querying orchestrator agent: {e}")
         return AgentPlanResponse(
             status="error",
             logs=[f"Failed to reach agent or agent timed out: {e}"],
             itinerary=[],
+            flights=[],
+            events=[],
             locations=[]
         )
 
 @app.post("/refine", response_model=AgentPlanResponse)
 async def refine_plan(request: RefineRequest):
     """
-    Receives an edited itinerary from the frontend and forwards it to the uAgent for refinement.
+    Receives an edited itinerary from the frontend and forwards it to the orchestrator for refinement.
     """
     try:
-        print(f"Forwarding refinement request to agent with {len(request.itinerary)} items")
+        print(f"Forwarding refinement request to orchestrator with {len(request.itinerary)} items")
         
-        # Send HTTP POST request to the agent's REST endpoint
+        # Send HTTP POST request to the orchestrator agent's REST endpoint
         async with httpx.AsyncClient() as client:
             response = await client.post(
                 f"{AGENT_URL}/refine",
                 json={"itinerary": request.itinerary, "locations": request.locations},
-                timeout=180.0  # Give the agent 3 minutes to run
+                timeout=180.0  # Give agents time to refine
             )
             
             print(f"Response status: {response.status_code}")
             
             if response.status_code == 200:
                 response_data = response.json()
-                print("Received successful refinement from agent.")
+                print("Received successful refinement from orchestrator.")
                 return AgentPlanResponse(**response_data)
             else:
                 error_msg = f"Agent returned status {response.status_code}: {response.text}"
@@ -133,16 +140,20 @@ async def refine_plan(request: RefineRequest):
                 return AgentPlanResponse(
                     status="error",
                     logs=[error_msg],
-                    itinerary=request.itinerary,  # Return original itinerary on error
+                    itinerary=request.itinerary,
+                    flights=[],
+                    events=[],
                     locations=request.locations
                 )
 
     except Exception as e:
-        print(f"Error querying agent for refinement: {e}")
+        print(f"Error querying orchestrator for refinement: {e}")
         return AgentPlanResponse(
             status="error",
             logs=[f"Failed to reach agent or agent timed out: {e}"],
-            itinerary=request.itinerary,  # Return original itinerary on error
+            itinerary=request.itinerary,
+            flights=[],
+            events=[],
             locations=request.locations
         )
 
