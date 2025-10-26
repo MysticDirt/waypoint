@@ -2,6 +2,7 @@ import React, { useState, useEffect, useRef, Component } from 'react'
 import axios from 'axios'
 import { MapContainer, TileLayer, Marker, Popup, useMap } from 'react-leaflet'
 import L from 'leaflet'
+import WaypointLogo from './assets/Waypoint_logo.svg'
 
 // Error Boundary Component
 class ErrorBoundary extends Component {
@@ -488,15 +489,15 @@ function App() {
   })
 
   return (
-    <div className="min-h-screen bg-gray-50">
+    <div className="min-h-screen bg-background">
       <div className="grid grid-cols-1 md:grid-cols-2 h-screen">
         {/* Left Column - Itinerary */}
         <div className="flex flex-col h-full overflow-hidden">
-          <div className="bg-white shadow-sm border-b">
+          <div className="bg-background shadow-sm border-b border-brand-light">
             <div className="p-6">
-              <h1 className="text-3xl font-bold text-gray-900 mb-6">
-                Waypoint
-              </h1>
+              <div className="mb-6">
+                <img src={WaypointLogo} alt="Waypoint" className="h-8" />
+              </div>
               
               <form onSubmit={handleSubmit} className="space-y-4">
                 <div className="flex gap-2">
@@ -505,13 +506,13 @@ function App() {
                     value={prompt}
                     onChange={(e) => setPrompt(e.target.value)}
                     placeholder="Enter your goal (e.g., 'Plan a cheap cultural weekend in Chicago')"
-                    className="flex-1 px-4 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+                    className="flex-1 px-4 py-2 border border-text-primary rounded-lg focus:outline-none focus:ring-2 focus:ring-brand-primary font-mulish"
                     disabled={isLoading}
                   />
                   <button
                     type="submit"
                     disabled={isLoading || !prompt.trim()}
-                    className="px-6 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:bg-gray-400 disabled:cursor-not-allowed transition-colors"
+                    className="px-6 py-2 bg-brand-primary text-brand-text rounded-lg hover:bg-opacity-90 disabled:bg-gray-400 disabled:cursor-not-allowed transition-all duration-300 font-mulish font-bold"
                   >
                     Plan
                   </button>
@@ -526,12 +527,12 @@ function App() {
               
               {/* Trip Context Display */}
               {tripContext && (
-                <div className="mt-4 p-3 bg-blue-50 border border-blue-200 rounded-lg">
+                <div className="mt-4 p-3 bg-brand-light bg-opacity-30 border border-brand-light rounded-lg">
                   <div className="flex items-start gap-2">
-                    <span className="text-blue-600 text-sm">🧠</span>
+                    <span className="text-brand-primary text-sm">🧠</span>
                     <div className="flex-1">
-                      <p className="text-xs font-semibold text-blue-900 mb-1">AI Memory - Current Trip Context:</p>
-                      <div className="text-xs text-blue-800 space-y-1">
+                      <p className="text-xs font-semibold text-text-primary mb-1 font-manrope">AI Memory - Current Trip Context:</p>
+                      <div className="text-xs text-text-secondary space-y-1 font-mulish">
                         {tripContext.destinations.length > 0 && (
                           <p><span className="font-medium">Destination:</span> {tripContext.destinations.join(', ')}</p>
                         )}
@@ -546,9 +547,9 @@ function App() {
               
               {/* Chat/Conversation Panel */}
               {conversation.length > 0 && (
-                <div className="mt-4 border border-gray-300 rounded-lg bg-white">
-                  <div className="bg-gray-100 px-4 py-2 border-b border-gray-300 rounded-t-lg">
-                    <h3 className="font-semibold text-sm text-gray-700">💬 Conversation with AI</h3>
+                <div className="mt-4 border border-brand-light rounded-lg bg-background">
+                  <div className="bg-brand-light bg-opacity-30 px-4 py-2 border-b border-brand-light rounded-t-lg">
+                    <h3 className="font-semibold text-sm text-text-primary font-manrope">💬 Conversation with AI</h3>
                   </div>
                   <div className="max-h-64 overflow-y-auto p-4 space-y-3">
                     {conversation.map((message, index) => (
@@ -557,14 +558,14 @@ function App() {
                         className={`flex ${message.role === 'user' ? 'justify-end' : 'justify-start'}`}
                       >
                         <div
-                          className={`max-w-[80%] rounded-lg px-4 py-3 ${
+                          className={`max-w-[80%] rounded-lg px-4 py-3 font-mulish ${
                             message.role === 'user'
-                              ? 'bg-blue-600 text-white'
+                              ? 'bg-brand-primary text-brand-text'
                               : message.status === 'error'
                               ? 'bg-red-100 text-red-800 border border-red-300'
                               : message.status === 'needs_clarification'
                               ? 'bg-yellow-50 text-yellow-900 border-2 border-yellow-400 shadow-md'
-                              : 'bg-gray-100 text-gray-800 border border-gray-300'
+                              : 'bg-brand-light bg-opacity-30 text-text-primary border border-brand-light'
                           }`}
                         >
                           {message.status === 'needs_clarification' && (
@@ -587,7 +588,7 @@ function App() {
                   
                   {/* Chat Input */}
                   <form onSubmit={handleChatSubmit} className={`border-t p-3 ${
-                    needsClarification ? 'bg-yellow-50 border-yellow-300' : 'border-gray-300'
+                    needsClarification ? 'bg-yellow-50 border-yellow-300' : 'border-brand-light'
                   }`}>
                     {needsClarification && (
                       <div className="mb-2 text-xs text-yellow-800 font-medium">
@@ -600,20 +601,20 @@ function App() {
                         value={chatInput}
                         onChange={(e) => setChatInput(e.target.value)}
                         placeholder={needsClarification ? "Type your answer here..." : "Reply to the AI or ask follow-up questions..."}
-                        className={`flex-1 px-3 py-2 text-sm border rounded-lg focus:outline-none focus:ring-2 ${
+                        className={`flex-1 px-3 py-2 text-sm border rounded-lg focus:outline-none focus:ring-2 font-mulish ${
                           needsClarification 
                             ? 'border-yellow-400 focus:ring-yellow-500 bg-white' 
-                            : 'border-gray-300 focus:ring-blue-500'
+                            : 'border-text-primary focus:ring-brand-primary'
                         }`}
                         disabled={isLoading}
                       />
                       <button
                         type="submit"
                         disabled={isLoading || !chatInput.trim()}
-                        className={`px-4 py-2 text-sm rounded-lg transition-colors disabled:bg-gray-400 disabled:cursor-not-allowed ${
+                        className={`px-4 py-2 text-sm rounded-lg transition-all duration-300 disabled:bg-gray-400 disabled:cursor-not-allowed font-mulish font-bold ${
                           needsClarification
                             ? 'bg-yellow-500 text-white hover:bg-yellow-600'
-                            : 'bg-blue-600 text-white hover:bg-blue-700'
+                            : 'bg-brand-primary text-brand-text hover:bg-opacity-90'
                         }`}
                       >
                         {needsClarification ? 'Answer' : 'Send'}
@@ -638,10 +639,10 @@ function App() {
             {/* Options Section - Show FIRST */}
             {!isLoading && options.length > 0 && (
               <div className="mb-8">
-                <h2 className="text-2xl font-bold text-gray-900 mb-2">
+                <h2 className="text-2xl font-bold text-text-primary mb-2 font-manrope">
                   ✈️ Select Your Travel Options
                 </h2>
-                <p className="text-sm text-gray-600 mb-4">
+                <p className="text-sm text-text-secondary mb-4 font-mulish">
                   Choose from the flights and events below to build your perfect itinerary:
                 </p>
                 
@@ -649,7 +650,7 @@ function App() {
                 {/* Outbound Flights Section */}
                 {options.some(opt => opt.type === 'flight' && opt.category === 'outbound_flight') && (
                   <div className="mb-6">
-                    <h3 className="text-lg font-semibold text-gray-800 mb-3">✈️ Outbound Flights</h3>
+                    <h3 className="text-lg font-semibold text-text-primary mb-3 font-manrope">✈️ Outbound Flights</h3>
                     <div className="space-y-3">
                       {options.filter(opt => opt.type === 'flight' && opt.category === 'outbound_flight').map((option) => {
                         // Debug: log the flight data structure
@@ -1060,11 +1061,11 @@ function App() {
             {!isLoading && itinerary.length > 0 && (
               <div className="space-y-4">
                 <div className="flex justify-between items-center mb-4">
-                  <h2 className="text-xl font-semibold text-gray-800">Your Itinerary</h2>
+                  <h2 className="text-xl font-semibold text-text-primary font-manrope">Your Itinerary</h2>
                   {hasChanges && (
                     <button
                       onClick={handleRefine}
-                      className="px-4 py-2 bg-green-600 text-white rounded-lg hover:bg-green-700 transition-colors"
+                      className="px-4 py-2 bg-brand-primary text-brand-text rounded-lg hover:bg-opacity-90 transition-all duration-300 font-mulish font-bold"
                     >
                       Yes, update plan
                     </button>
@@ -1155,7 +1156,7 @@ function App() {
 }
 
 // Wrap App with Error Boundary
-function AppWithErrorBoundary() {
+function PlannerApp() {
   return (
     <ErrorBoundary>
       <App />
@@ -1163,4 +1164,4 @@ function AppWithErrorBoundary() {
   )
 }
 
-export default AppWithErrorBoundary
+export default PlannerApp

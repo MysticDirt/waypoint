@@ -1,6 +1,6 @@
 import React from 'react'
 import ReactDOM from 'react-dom/client'
-import App from './App.jsx'
+import AppRouter from './Router.jsx'
 import './index.css'
 import 'leaflet/dist/leaflet.css'
 
@@ -14,7 +14,7 @@ if (!rootElement) {
   console.log('Creating React root...')
   ReactDOM.createRoot(rootElement).render(
     <React.StrictMode>
-      <App />
+      <AppRouter />
     </React.StrictMode>,
   )
   console.log('React app rendered')
