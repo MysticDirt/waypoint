@@ -1,13 +1,12 @@
-# flights_tool.py
+# flights_tool.py (hardened)
+
 from __future__ import annotations
-import os
+import os, json
 from datetime import date
 from typing import Any, Dict, List, Optional, TypedDict
 from serpapi import GoogleSearch
-from dotenv import load_dotenv
 
-load_dotenv()
-
+DEBUG = os.getenv("DEBUG_FLIGHTS") == "1"
 
 class FlightLeg(TypedDict, total=False):
     airline: str
@@ -19,7 +18,6 @@ class FlightLeg(TypedDict, total=False):
     arrival_time: str
     layovers: List[str]
 
-
 class FlightOption(TypedDict, total=False):
     title: str
     total_price: Optional[str]
@@ -30,17 +28,20 @@ class FlightOption(TypedDict, total=False):
     legs_out: List[FlightLeg]
     legs_return: List[FlightLeg]
 
-
 def _require_api_key() -> str:
     key = os.getenv("SERPAPI_API_KEY")
     if not key:
         raise RuntimeError("Set SERPAPI_API_KEY in your environment.")
     return key
 
-
 def _fmt_date(d: date | str) -> str:
     return d if isinstance(d, str) else d.isoformat()
 
+def _safe_list(x: Any) -> List[Any]:
+    return x if isinstance(x, list) else []
+
+def _safe_dicts(seq: Any) -> List[Dict[str, Any]]:
+    return [it for it in _safe_list(seq) if isinstance(it, dict)]
 
 def _parse_leg(seg: Dict[str, Any]) -> FlightLeg:
     return FlightLeg(
@@ -51,32 +52,164 @@ def _parse_leg(seg: Dict[str, Any]) -> FlightLeg:
         departure_time=seg.get("departure_time"),
         arrival_airport=seg.get("arrival_airport"),
         arrival_time=seg.get("arrival_time"),
-        layovers=[l.get("name") for l in seg.get("layovers", []) if isinstance(l, dict)],
+        layovers=[l.get("name") for l in _safe_dicts(seg.get("layovers"))],
+    )
+
+# ---- replace these functions in flights_tool.py ----
+
+def _pick_price(f: Dict[str, Any]) -> tuple[Optional[str], Optional[str]]:
+    """
+    Returns (total_price, currency) as strings when possible.
+    SerpApi variants observed: 
+      f["price"] = {"price": "129", "currency": "USD"}
+      f["price"] = {"amount": 129, "currency": "USD"}
+      f["price"] = "$129"
+    """
+    p = f.get("price")
+    if isinstance(p, dict):
+        price_val = p.get("price") or p.get("amount")
+        if price_val is not None:
+            return (str(price_val), p.get("currency"))
+    if isinstance(p, (int, float)):
+        return (str(p), None)
+    if isinstance(p, str):
+        # "$129" -> ("129", "USD") best-effort
+        import re
+        m = re.search(r"([$\£\€])?\s*([0-9]+(?:\.[0-9]+)?)", p)
+        if m:
+            cur = {"$":"USD","£":"GBP","€":"EUR"}.get(m.group(1))
+            return (m.group(2), cur)
+    return (None, None)
+
+
+def _coerce_time(val: Any) -> Optional[str]:
+    """
+    Accepts "3:15 PM", "15:15", "2025-11-21T15:15", unix ts, etc.
+    Returns a display string; you can keep it as-is (Claude will format).
+    """
+    if val is None:
+        return None
+    if isinstance(val, (int, float)):
+        # treat as unix seconds
+        from datetime import datetime
+        try:
+            return datetime.utcfromtimestamp(val).strftime("%Y-%m-%dT%H:%M:%S")
+        except Exception:
+            return None
+    # strings: just return, we don't enforce ISO here
+    return str(val)
+
+
+def _parse_leg_variant(seg: Dict[str, Any]) -> FlightLeg:
+    """
+    Normalizes across segment shapes:
+      - keys directly on segment
+      - nested: departure/arrival airport objects with 'code' or 'name'
+      - times in 'departure_time' / 'arrival_time' or nested 'time' fields
+    """
+    dep_air = seg.get("departure_airport") or seg.get("from") or seg.get("departure") or {}
+    arr_air = seg.get("arrival_airport") or seg.get("to") or seg.get("arrival") or {}
+
+    def _code_or_name(x):
+        if isinstance(x, dict):
+            return x.get("code") or x.get("iata") or x.get("name")
+        return x
+
+    airline = seg.get("airline") or (seg.get("carrier") or {}).get("name")
+    flight_no = seg.get("flight_number") or seg.get("number")
+
+    dep_time = _coerce_time(seg.get("departure_time") or seg.get("departure") or (dep_air.get("time") if isinstance(dep_air, dict) else None))
+    arr_time = _coerce_time(seg.get("arrival_time") or seg.get("arrival") or (arr_air.get("time") if isinstance(arr_air, dict) else None))
+
+    # duration could be minutes int or "2h 15m"
+    duration = seg.get("duration")
+    if isinstance(duration, (int, float)):
+        duration = str(int(duration))
+
+    layovers = []
+    for l in seg.get("layovers") or []:
+        if isinstance(l, dict):
+            layovers.append(l.get("name") or l.get("code"))
+
+    return FlightLeg(
+        airline=airline,
+        flight_number=str(flight_no) if flight_no is not None else None,
+        duration=duration,
+        departure_airport=_code_or_name(dep_air),
+        departure_time=dep_time,
+        arrival_airport=_code_or_name(arr_air),
+        arrival_time=arr_time,
+        layovers=layovers,
     )
 
 
 def _extract_options(bucket: Dict[str, Any]) -> List[FlightOption]:
     out: List[FlightOption] = []
-    for f in bucket.get("flights", []):
+    flights = _safe_list(bucket.get("flights"))
+    if not flights and isinstance(bucket.get("flights"), dict):
+        flights = _safe_list(bucket["flights"].get("flights"))
+
+    for f in flights:
+        if not isinstance(f, dict):
+            continue
+
+        # Price (robust)
+        total_price, currency = _pick_price(f)
+
+        # Booking links
+        links: List[Dict[str, str]] = []
+        for lb in _safe_dicts(f.get("booking_links")):
+            price_str = None
+            if isinstance(lb.get("price"), dict):
+                price_str = lb["price"].get("price") or lb["price"].get("amount")
+            elif isinstance(lb.get("price"), (int, float, str)):
+                price_str = str(lb.get("price"))
+            links.append({
+                "provider": lb.get("provider_name") or lb.get("type") or "Unknown",
+                "link": lb.get("link"),
+                "price": price_str,
+            })
+
+        # Find leg arrays under several possible keys
+        legs_candidates = []
+        for key in ("segments", "legs", "flight_legs"):
+            if isinstance(f.get(key), list):
+                legs_candidates = f[key]
+                break
+        if not legs_candidates:
+            # sometimes nested under 'itinerary': {'outbound': [...], 'return': [...]}
+            itin = f.get("itinerary") or {}
+            if isinstance(itin, dict):
+                legs_candidates = _safe_list(itin.get("outbound"))  # we'll treat outbound here
+
+        legs_out = [_parse_leg_variant(s) for s in _safe_dicts(legs_candidates)]
+
+        # Return legs (if present in familiar keys)
+        ret_candidates = []
+        for key in ("return_segments", "return_legs"):
+            if isinstance(f.get(key), list):
+                ret_candidates = f[key]
+                break
+        if not ret_candidates and isinstance(f.get("itinerary"), dict):
+            ret_candidates = _safe_list(f["itinerary"].get("return"))
+
+        legs_return = [_parse_leg_variant(s) for s in _safe_dicts(ret_candidates)]
+
+        # Durations can be ints (minutes) or strings
+        out_dur = f.get("total_duration") or f.get("outbound_duration") or f.get("duration")
+        ret_dur = f.get("return_total_duration") or f.get("inbound_duration")
+
         out.append(FlightOption(
             title=bucket.get("type") or bucket.get("title"),
-            total_price=(f.get("price") or {}).get("price"),
-            currency=(f.get("price") or {}).get("currency"),
-            out_duration=f.get("total_duration"),
-            ret_duration=f.get("return_total_duration"),
-            booking_links=[
-                {
-                    "provider": lb.get("provider_name") or lb.get("type") or "Unknown",
-                    "link": lb.get("link"),
-                    "price": (lb.get("price") or {}).get("price"),
-                }
-                for lb in f.get("booking_links", [])
-            ],
-            legs_out=[_parse_leg(s) for s in f.get("segments", [])],
-            legs_return=[_parse_leg(s) for s in f.get("return_segments", [])],
+            total_price=total_price,
+            currency=currency,
+            out_duration=str(out_dur) if out_dur is not None else None,
+            ret_duration=str(ret_dur) if ret_dur is not None else None,
+            booking_links=links,
+            legs_out=legs_out,
+            legs_return=legs_return,
         ))
     return out
-
 
 def find_flights(
     origin: str,
@@ -91,8 +224,8 @@ def find_flights(
     hl: str = "en",
     gl: str = "us",
 ) -> Dict[str, Any]:
-    """Calls SerpApi Google Flights and returns normalized flight buckets."""
-    _require_api_key()  # ensures key present
+    """Calls SerpApi Google Flights and returns normalized flight buckets (defensive)."""
+    _require_api_key()
 
     params: Dict[str, Any] = {
         "engine": "google_flights",
@@ -112,17 +245,43 @@ def find_flights(
     if non_stop is True:
         params["stops"] = 0
 
-    results = GoogleSearch(params).get_dict()
+    raw = GoogleSearch(params).get_dict()
 
-    best_bucket = {"type": "Best departing flights", "flights": results.get("best_flights", [])}
-    other_bucket = {"type": "Other departing flights", "flights": results.get("other_flights", [])}
-    best_return_bucket = {"type": "Best returning flights", "flights": results.get("best_return_flights", [])}
-    other_return_bucket = {"type": "Other returning flights", "flights": results.get("other_return_flights", [])}
+    # If something upstream gave us a JSON string, parse it
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except Exception:
+            raw = {}
 
-    return {
+    # Normalize buckets: allow weird shapes and ensure we pass a list into _extract_options
+    def bucketize(title: str, items: Any) -> Dict[str, Any]:
+        # items can be list/dict/None/int/etc. Normalize to list under key "flights"
+        if isinstance(items, list):
+            flights = items
+        elif isinstance(items, dict) and isinstance(items.get("flights"), list):
+            flights = items["flights"]
+        else:
+            flights = []  # fallback
+            if DEBUG and items is not None:
+                print(f"[find_flights] Unexpected bucket type for '{title}':", type(items), items)
+        return {"type": title, "flights": flights}
+
+    best_bucket         = bucketize("Best departing flights", raw.get("best_flights"))
+    other_bucket        = bucketize("Other departing flights", raw.get("other_flights"))
+    best_return_bucket  = bucketize("Best returning flights", raw.get("best_return_flights"))
+    other_return_bucket = bucketize("Other returning flights", raw.get("other_return_flights"))
+
+    normalized = {
         "best": _extract_options(best_bucket),
         "other": _extract_options(other_bucket),
         "best_return": _extract_options(best_return_bucket),
         "other_return": _extract_options(other_return_bucket),
-        "raw": results,
+        "raw": raw,  # keep for debugging/inspection
     }
+
+    # Final guard: ensure lists
+    for k in ("best", "other", "best_return", "other_return"):
+        if not isinstance(normalized.get(k), list):
+            normalized[k] = []
+    return normalized
