@@ -1,4 +1,4 @@
-# proactive_life_manager_agent.py
+# waypoint_agent.py
 # uAgents-only server: planning (Claude), refinement (Groq), and profile context
 # Tools: SerpApi (Google Flights / Hotels / Events) via `google-search-results` client
 #
@@ -9,7 +9,7 @@
 #   export SERPAPI_API_KEY=...
 #
 # Run:
-#   python proactive_life_manager_agent.py
+#   python waypoint_agent.py
 #
 # Notes:
 # - This file intentionally uses uAgents for REST endpoints (no FastAPI).
@@ -1016,7 +1016,7 @@ def build_conversation_messages(conversation_history: List[Dict[str, Any]], curr
 # =========================
 
 agent = Agent(
-    name="proactive_life_manager_agent",
+    name="waypoint_agent",
     port=8001,
     seed="my_cal_hacks_secret_seed_phrase"
 )
@@ -1138,7 +1138,7 @@ Output format:
 
     # ---- Stage 2: Synthesis (force JSON object)
     synthesis_system_prompt = """
-You are a 'Proactive Life Manager Agent'. Create a valid JSON object only.
+You are 'Waypoint'. Create a valid JSON object only.
 
 CONTEXT AWARENESS:
 - You will receive trip_context and conversation_summary in the payload
