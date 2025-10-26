@@ -150,75 +150,158 @@ def _parse_leg_variant(seg: Dict[str, Any]) -> FlightLeg:
         layovers=layovers,
     )
 
+# Put this helper near the top of flights_tool.py
+def _airport_code_or_name(x):
+    if isinstance(x, dict):
+        return x.get("code") or x.get("iata") or x.get("name")
+    return x
 
-
-def _extract_options(bucket: Dict[str, Any]) -> List[FlightOption]:
+def _extract_options_from_serpapi_v1(bucket: Any, raw: Dict[str, Any]) -> List[FlightOption]:
+    """
+    Accepts either:
+      - a list of flight items (SerpApi’s best_flights/other_flights are lists)
+      - a dict with a "flights" list (our own bucketizer)
+    Returns a list[FlightOption].
+    """
     out: List[FlightOption] = []
-    flights = _safe_list(bucket.get("flights"))
-    if not flights and isinstance(bucket.get("flights"), dict):
-        flights = _safe_list(bucket["flights"].get("flights"))
 
-    for f in flights:
+    # default currency fallback from search_parameters
+    default_ccy = None
+    sp = raw.get("search_parameters")
+    if isinstance(sp, dict):
+        default_ccy = sp.get("currency")
+
+    # ---- SAFE items extraction (no .get on list) ----
+    if isinstance(bucket, list):
+        items = bucket
+        bucket_title = "Departing flights"
+    elif isinstance(bucket, dict):
+        flights_val = bucket.get("flights")
+        items = flights_val if isinstance(flights_val, list) else []
+        bucket_title = bucket.get("type") or "Departing flights"
+    else:
+        items = []
+        bucket_title = "Departing flights"
+
+    for f in items:
         if not isinstance(f, dict):
             continue
 
-        # Price (robust)
-        total_price, currency = _pick_price(f)
+        # ---- price ----
+        p = f.get("price")
+        total_price = None
+        currency = None
+        if isinstance(p, dict):
+            total_price = str(p.get("price") or p.get("amount") or p.get("display") or "").strip() or None
+            currency = p.get("currency") or default_ccy
+        elif isinstance(p, (int, float, str)):
+            total_price = str(p)
+            currency = default_ccy
 
-        # Booking links
+        # ---- legs (SerpApi puts legs under 'flights') ----
+        legs_out: List[FlightLeg] = []
+        legs_src = f.get("flights")
+        if isinstance(legs_src, list):
+            for seg in legs_src:
+                if not isinstance(seg, dict):
+                    continue
+
+                airline_name = (
+                    seg.get("airline")
+                    or (seg.get("carrier") or {}).get("name")
+                    or (seg.get("operating_carrier") or {}).get("name")
+                )
+                airline_code = (
+                    (seg.get("carrier") or {}).get("iata")
+                    or (seg.get("carrier") or {}).get("code")
+                    or (seg.get("operating_carrier") or {}).get("iata")
+                )
+                fno = (
+                    seg.get("flight_number")
+                    or seg.get("number")
+                    or (seg.get("flight") or {}).get("number")
+                    or (seg.get("flight") or {}).get("code")
+                )
+                if fno:
+                    fno_str = str(fno)
+                    flight_number = (
+                        f"{airline_code}{fno_str}"
+                        if (airline_code and not fno_str.upper().startswith(airline_code))
+                        else fno_str
+                    )
+                else:
+                    flight_number = None
+
+                dep = seg.get("departure_airport") or seg.get("from") or seg.get("departure") or {}
+                arr = seg.get("arrival_airport")   or seg.get("to")   or seg.get("arrival")   or {}
+
+                def _code_or_name(x):
+                    if isinstance(x, dict):
+                        return x.get("code") or x.get("iata") or x.get("name")
+                    return x
+
+                dep_time = seg.get("departure_time") or (dep.get("time") if isinstance(dep, dict) else None)
+                arr_time = seg.get("arrival_time")   or (arr.get("time") if isinstance(arr, dict) else None)
+
+                duration = seg.get("duration")
+                if isinstance(duration, (int, float)):
+                    duration = str(int(duration))
+
+                layovers: List[str] = []
+                for s in (seg.get("stops") or seg.get("layovers") or []):
+                    if isinstance(s, dict):
+                        layovers.append(s.get("name") or s.get("code"))
+                    else:
+                        layovers.append(str(s))
+
+                legs_out.append(FlightLeg(
+                    airline=airline_name or airline_code,
+                    flight_number=flight_number,
+                    duration=duration,
+                    departure_airport=_code_or_name(dep),
+                    departure_time=str(dep_time) if dep_time else None,
+                    arrival_airport=_code_or_name(arr),
+                    arrival_time=str(arr_time) if arr_time else None,
+                    layovers=layovers,
+                ))
+
+        # ---- durations ----
+        out_dur = f.get("total_duration")
+        if isinstance(out_dur, (int, float)):
+            out_dur = str(int(out_dur))
+        ret_dur = f.get("return_total_duration")
+        if isinstance(ret_dur, (int, float)):
+            ret_dur = str(int(ret_dur))
+
+        # ---- booking links (if any) ----
         links: List[Dict[str, str]] = []
-        for lb in _safe_dicts(f.get("booking_links")):
-            price_str = None
-            if isinstance(lb.get("price"), dict):
-                price_str = lb["price"].get("price") or lb["price"].get("amount")
-            elif isinstance(lb.get("price"), (int, float, str)):
-                price_str = str(lb.get("price"))
-            links.append({
-                "provider": lb.get("provider_name") or lb.get("type") or "Unknown",
-                "link": lb.get("link"),
-                "price": price_str,
-            })
-
-        # Find leg arrays under several possible keys
-        legs_candidates = []
-        for key in ("segments", "legs", "flight_legs"):
-            if isinstance(f.get(key), list):
-                legs_candidates = f[key]
-                break
-        if not legs_candidates:
-            # sometimes nested under 'itinerary': {'outbound': [...], 'return': [...]}
-            itin = f.get("itinerary") or {}
-            if isinstance(itin, dict):
-                legs_candidates = _safe_list(itin.get("outbound"))  # we'll treat outbound here
-
-        legs_out = [_parse_leg_variant(s) for s in _safe_dicts(legs_candidates)]
-
-        # Return legs (if present in familiar keys)
-        ret_candidates = []
-        for key in ("return_segments", "return_legs"):
-            if isinstance(f.get(key), list):
-                ret_candidates = f[key]
-                break
-        if not ret_candidates and isinstance(f.get("itinerary"), dict):
-            ret_candidates = _safe_list(f["itinerary"].get("return"))
-
-        legs_return = [_parse_leg_variant(s) for s in _safe_dicts(ret_candidates)]
-
-        # Durations can be ints (minutes) or strings
-        out_dur = f.get("total_duration") or f.get("outbound_duration") or f.get("duration")
-        ret_dur = f.get("return_total_duration") or f.get("inbound_duration")
+        for lb in (f.get("booking_links") or []):
+            if isinstance(lb, dict):
+                price_str = None
+                if isinstance(lb.get("price"), dict):
+                    price_str = lb["price"].get("price") or lb["price"].get("amount")
+                elif isinstance(lb.get("price"), (int, float, str)):
+                    price_str = str(lb.get("price"))
+                links.append({
+                    "provider": lb.get("provider_name") or lb.get("type") or "Unknown",
+                    "link": lb.get("link"),
+                    "price": price_str,
+                })
 
         out.append(FlightOption(
-            title=bucket.get("type") or bucket.get("title"),
+            title=bucket_title,
             total_price=total_price,
             currency=currency,
-            out_duration=str(out_dur) if out_dur is not None else None,
-            ret_duration=str(ret_dur) if ret_dur is not None else None,
+            out_duration=out_dur,
+            ret_duration=ret_dur,
             booking_links=links,
             legs_out=legs_out,
-            legs_return=legs_return,
+            legs_return=[],  # round-trip returns are in separate buckets
         ))
+
     return out
+
+
 
 def find_flights(
     origin: str,
@@ -256,6 +339,18 @@ def find_flights(
 
     raw = GoogleSearch(params).get_dict()
 
+    if os.getenv("DEBUG_FLIGHTS") == "1":
+        import pprint
+        print("[google_flights raw keys]:", list(raw.keys())[:20])
+        # Print one candidate from each bucket (truncated)
+        for k in ("best_flights","other_flights","best_return_flights","other_return_flights"):
+            v = raw.get(k)
+            if isinstance(v, list) and v:
+                print(f"[{k} sample keys]:", list(v[0].keys()))
+            elif isinstance(v, dict):
+                print(f"[{k} dict keys]:", list(v.keys()))
+
+
     # If something upstream gave us a JSON string, parse it
     if isinstance(raw, str):
         try:
@@ -276,18 +371,35 @@ def find_flights(
                 print(f"[find_flights] Unexpected bucket type for '{title}':", type(items), items)
         return {"type": title, "flights": flights}
 
-    best_bucket         = bucketize("Best departing flights", raw.get("best_flights"))
-    other_bucket        = bucketize("Other departing flights", raw.get("other_flights"))
-    best_return_bucket  = bucketize("Best returning flights", raw.get("best_return_flights"))
-    other_return_bucket = bucketize("Other returning flights", raw.get("other_return_flights"))
+    # After you get `raw = GoogleSearch(params).get_dict()`
+
+    best_list         = raw.get("best_flights") or []
+    other_list        = raw.get("other_flights") or []
+    best_return_list  = raw.get("best_return_flights") or []
+    other_return_list = raw.get("other_return_flights") or []
 
     normalized = {
-        "best": _extract_options(best_bucket),
-        "other": _extract_options(other_bucket),
-        "best_return": _extract_options(best_return_bucket),
-        "other_return": _extract_options(other_return_bucket),
-        "raw": raw,  # keep for debugging/inspection
+        "best": _extract_options_from_serpapi_v1(best_list, raw),
+        "other": _extract_options_from_serpapi_v1(other_list, raw),
+        "best_return": _extract_options_from_serpapi_v1(best_return_list, raw),
+        "other_return": _extract_options_from_serpapi_v1(other_return_list, raw),
+        "raw": raw,
     }
+
+    # Final guard
+    if isinstance(normalized, list):
+        normalized = {"best": normalized, "other": [], "best_return": [], "other_return": [], "raw": raw}
+    elif isinstance(normalized, dict):
+        for k in ("best", "other", "best_return", "other_return"):
+            if not isinstance(normalized.get(k), list):
+                normalized[k] = []
+    else:
+        normalized = {"best": [], "other": [], "best_return": [], "other_return": [], "raw": raw}
+
+    return normalized
+
+
+
 
     # Final guard: ensure lists
     for k in ("best", "other", "best_return", "other_return"):
