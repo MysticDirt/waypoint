@@ -206,7 +206,6 @@ marimo/_static/
 marimo/_lsp/
 __marimo__/
 
-#build stuff
+# Node
 frontend/node_modules
-backend/node_modules
-agent/node_modules
+.DS_Store
