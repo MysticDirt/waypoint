@@ -4,8 +4,18 @@ import App from './App.jsx'
 import './index.css'
 import 'leaflet/dist/leaflet.css'
 
-ReactDOM.createRoot(document.getElementById('root')).render(
-  <React.StrictMode>
-    <App />
-  </React.StrictMode>,
-)
+console.log('main.jsx loading...')
+const rootElement = document.getElementById('root')
+console.log('Root element:', rootElement)
+
+if (!rootElement) {
+  console.error('Root element not found!')
+} else {
+  console.log('Creating React root...')
+  ReactDOM.createRoot(rootElement).render(
+    <React.StrictMode>
+      <App />
+    </React.StrictMode>,
+  )
+  console.log('React app rendered')
+}

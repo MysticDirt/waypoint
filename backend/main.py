@@ -50,6 +50,7 @@ class AgentPlanResponse(BaseModel):
     itinerary: List[Dict[str, Any]]
     logs: List[str]
     locations: List[Dict[str, Any]]
+    options: List[Dict[str, Any]] = []  # Flight and event options for user selection
 
 # This is the model *we send* to the agent
 class PlanRequest(BaseModel):
@@ -122,7 +123,7 @@ async def create_plan(request: UserGoalRequest):
                     "itinerary": request.itinerary,
                     "locations": request.locations
                 },
-                timeout=30.0
+                timeout=120.0  # Give agent 2 minutes for flight/event searches
             )
             print(f"Response status: {response.status_code}")
             if response.status_code == 200:

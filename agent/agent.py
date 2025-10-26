@@ -69,6 +69,7 @@ class AgentPlanResponse(Model):
     itinerary: list       # List[dict] of itinerary items
     logs: list            # List[str] for trace / notes
     locations: list       # List[dict] map markers
+    options: list = []    # List[dict] of selectable options (flights, events, hotels)
 
 class RefineRequest(Model):
     itinerary: list
@@ -350,7 +351,34 @@ def search_real_events(query: str) -> str:
                     "source": ev.get("source") or "google_events",
                 })
             # keep only items with a title + some date
-            return [n for n in out if n["title"] and n["start_date"]]
+            out = [n for n in out if n["title"] and n["start_date"]]
+            
+            # Filter based on trip dates if available
+            global _trip_dates
+            if _trip_dates.get("start_date") and _trip_dates.get("end_date"):
+                try:
+                    trip_start = _dt.strptime(_trip_dates["start_date"], "%Y-%m-%d")
+                    trip_end = _dt.strptime(_trip_dates["end_date"], "%Y-%m-%d")
+                    # Allow events up to 7 days after trip end
+                    trip_end_extended = trip_end + timedelta(days=7)
+                    
+                    filtered = []
+                    for event in out:
+                        if event["start_date"]:
+                            try:
+                                event_date = _dt.strptime(event["start_date"], "%Y-%m-%d")
+                                # Keep event if it's within [trip_start, trip_end + 7 days]
+                                if trip_start <= event_date <= trip_end_extended:
+                                    filtered.append(event)
+                            except Exception:
+                                # If date parsing fails, keep the event
+                                filtered.append(event)
+                    out = filtered
+                    print(f"Filtered events based on trip dates {_trip_dates['start_date']} to {_trip_dates['end_date']} (+7 days): {len(out)} events remain")
+                except Exception as e:
+                    print(f"Error filtering events by trip dates: {e}")
+            
+            return out
 
         # --- A) strict google_events (only if we have a clean ISO range) ---
         base = {"engine": "google_events", "api_key": SERPAPI_API_KEY, "hl": "en", "gl": "us"}
@@ -697,6 +725,106 @@ def safe_json_from_prefill_object(text: str) -> Dict[str, Any]:
         s = s.split("```")[1].split("```")[0]
     return json.loads(s)
 
+# Global variable to store trip dates for event filtering
+_trip_dates = {"start_date": None, "end_date": None}
+
+def extract_trip_context(conversation_history: List[Dict[str, Any]], current_itinerary: List[Dict[str, Any]]) -> str:
+    """
+    Extract key trip details from conversation history and current itinerary to maintain context.
+    Returns a formatted string with trip context that can be prepended to prompts.
+    Also updates global _trip_dates for event filtering.
+    """
+    global _trip_dates
+    context_parts = []
+    
+    # Extract from itinerary if available
+    if current_itinerary:
+        destinations = set()
+        dates = []
+        for item in current_itinerary:
+            # Extract destinations from titles/descriptions
+            if item.get('details', {}).get('flight'):
+                flight = item['details']['flight']
+                if flight.get('arrival_airport'):
+                    dest = flight['arrival_airport']
+                    if isinstance(dest, dict):
+                        destinations.add(dest.get('code', ''))
+                    else:
+                        destinations.add(str(dest))
+            # Extract dates from all items
+            if item.get('startTime'):
+                try:
+                    date_str = item['startTime'].split('T')[0]
+                    dates.append(date_str)
+                except:
+                    pass
+        
+        if destinations:
+            context_parts.append(f"Destination(s): {', '.join(destinations)}")
+        if dates:
+            sorted_dates = sorted(dates)
+            # Store trip dates globally for event filtering
+            _trip_dates["start_date"] = sorted_dates[0]
+            _trip_dates["end_date"] = sorted_dates[-1] if len(sorted_dates) > 1 else sorted_dates[0]
+            
+            if len(sorted_dates) >= 2:
+                context_parts.append(f"Trip dates: {sorted_dates[0]} to {sorted_dates[-1]}")
+            elif sorted_dates:
+                context_parts.append(f"Trip date: {sorted_dates[0]}")
+    
+    # Extract from conversation history - look for explicit date mentions
+    if conversation_history and not dates:
+        import re
+        for msg in conversation_history[-5:]:
+            content = msg.get('content', '')
+            # Look for ISO date patterns
+            date_matches = re.findall(r'\b(\d{4}-\d{2}-\d{2})\b', content)
+            if date_matches:
+                dates.extend(date_matches)
+        
+        if dates:
+            sorted_dates = sorted(set(dates))
+            _trip_dates["start_date"] = sorted_dates[0]
+            _trip_dates["end_date"] = sorted_dates[-1] if len(sorted_dates) > 1 else sorted_dates[0]
+            if len(sorted_dates) >= 2:
+                context_parts.append(f"Trip dates: {sorted_dates[0]} to {sorted_dates[-1]}")
+            elif sorted_dates:
+                context_parts.append(f"Trip date: {sorted_dates[0]}")
+    
+    if context_parts:
+        return "TRIP CONTEXT: " + " | ".join(context_parts) + "\n"
+    return ""
+
+def build_conversation_messages(conversation_history: List[Dict[str, Any]], current_prompt: str, context_prefix: str = "") -> List[Dict[str, str]]:
+    """
+    Build a proper message history for Claude API that includes conversation context.
+    Converts frontend conversation format to Claude's expected format.
+    """
+    messages = []
+    
+    # Add previous conversation turns
+    for msg in conversation_history:
+        role = msg.get('role')
+        content = msg.get('content', '')
+        
+        # Skip empty messages or system messages
+        if not content or role not in ['user', 'assistant']:
+            continue
+        
+        # Claude expects 'user' and 'assistant' roles
+        messages.append({
+            "role": role,
+            "content": content
+        })
+    
+    # Add current prompt
+    messages.append({
+        "role": "user",
+        "content": context_prefix + current_prompt
+    })
+    
+    return messages
+
 # =========================
 # 5) AGENT & ENDPOINTS (uAgents only)
 # =========================
@@ -723,18 +851,28 @@ async def handle_plan_request(ctx: Context, msg: PlanRequest) -> AgentPlanRespon
         f"user_lon={current_profile.longitude}; user_timezone={current_profile.timezone}; "
         f"now_utc={now_iso}. Always plan into the future from now; avoid past dates.\n"
     )
+    
+    # Extract trip context from conversation history and itinerary
+    trip_context = extract_trip_context(msg.conversation_history, msg.itinerary)
+    full_context = context_prefix + trip_context
 
     # ---- Stage 1: Planning (force JSON array)
     plan_system_prompt = f"""
 You are a planning AI. Output a JSON array ONLY. No prose, no notes, no markdown.
 
 Rules:
+- REMEMBER THE TRIP CONTEXT: If the user has already specified a destination, dates, or preferences in previous messages, USE THEM.
+- **CRITICAL: REMEMBER TRIP DATES** - Once trip start and end dates are established, ALWAYS use them for all subsequent searches.
+- When searching for events, ALWAYS include the trip dates in the query (e.g., "Chicago events 2025-11-21 to 2025-11-23").
+- The system will automatically filter events to show only those between trip start and trip end + 7 days.
 - If the user does not specify an ORIGIN airport for flights, use the user's home metro based on profile (e.g., {current_profile.city}) and prefer the primary airport (use our heuristic).
-- For events, default search 'location' to the user's city: {current_profile.city}.
+- For events, default search 'location' to the destination city mentioned in the trip context or user's city: {current_profile.city}.
 - Never pick dates in the past.
 - Flights query MUST include origin, destination, and a future depart date (YYYY-MM-DD).
 - If unsure about return, include a best-guess (Fri–Sun).
 - Tools you can call: {json.dumps(list(AVAILABLE_TOOLS.keys()))}
+- When user asks follow-up questions like "show me more events" or "find cheaper flights", refer to the trip context to know which destination and dates to search.
+- MAINTAIN DATE CONSISTENCY: If trip dates are in the trip context, use those exact dates for all event and hotel searches.
 
 Output format:
 [
@@ -745,14 +883,22 @@ Output format:
 """
     try:
         logs.append("Planning with Claude…")
+        
+        # Build conversation messages with history
+        planning_messages = build_conversation_messages(
+            msg.conversation_history,
+            goal,
+            full_context
+        )
+        
+        # Add the assistant prefill
+        planning_messages.append({"role": "assistant", "content": "["})
+        
         plan_message = claude_client.messages.create(
             model="claude-3-5-haiku-20241022",
             max_tokens=1024,
             system=plan_system_prompt,
-            messages=[
-                {"role": "user", "content": context_prefix + goal},
-                {"role": "assistant", "content": "["},  # force JSON array continuation
-            ],
+            messages=planning_messages,
             temperature=0.2,
         )
         tool_plan = safe_json_from_prefill_array(plan_message.content[0].text)
@@ -808,6 +954,12 @@ Output format:
     synthesis_system_prompt = """
 You are a 'Proactive Life Manager Agent'. Create a valid JSON object only.
 
+CONTEXT AWARENESS:
+- You will receive trip_context and conversation_summary in the payload
+- ALWAYS refer to these to maintain continuity about the destination, dates, and user preferences
+- If the user asks follow-up questions (e.g., "show me more events"), use the existing trip context
+- Remember what the user has already selected or expressed interest in
+
 STRICT FIELD REQUIREMENTS:
 - FLIGHTS: airline, flight_number, total_price, currency, out_duration,
   departure_airport, departure_time, arrival_airport, arrival_time, booking_link.
@@ -820,6 +972,16 @@ SCHEDULING RULES:
 - No overlapping items. Keep ≥30 min buffers between activities; ≥90 min before flights.
 - Prefer 2–4 activities per full day. If conflicts occur, keep the best and drop the rest.
   Log drops as 'conflict_removed'.
+- IMPORTANT: Include at least 1-2 events/activities in the itinerary for each day of the trip
+- Events should be type='activity' in the itinerary
+
+OPTIONS FOR USER SELECTION:
+- Include ALL available flights in the 'options' array (not just alternatives)
+- Include ALL available events in the 'options' array (not just alternatives)
+- Each option should have: type ('flight'|'event'|'hotel'), category (e.g., 'outbound_flight', 'activity_option'), data (full details), and a unique option_id
+- The itinerary should only contain confirmed/booked items or be empty initially
+- Users will select from options to build their itinerary
+- In logs, tell users to select their preferred flights and activities from the options below
 
 OUTPUT SHAPE:
 {
@@ -835,6 +997,17 @@ OUTPUT SHAPE:
       "details": {
         "flight": {...}, "hotel": {...}, "event": {...}
       }
+    }
+  ],
+  "options": [
+    {
+      "option_id": "uuid",
+      "type": "flight" | "event" | "hotel",
+      "category": "outbound_flight" | "return_flight" | "activity_option" | "lodging_option",
+      "title": "string",
+      "description": "string",
+      "data": {...},
+      "replaces_itinerary_id": "uuid or null"
     }
   ],
   "logs": ["..."],
@@ -855,7 +1028,13 @@ Respond with JSON only (no fences, no prose).
             "city": current_profile.city,
             "timezone": current_profile.timezone,
             "now_utc": now_iso
-        }
+        },
+        "trip_context": trip_context,  # Include extracted trip context
+        "conversation_summary": [
+            {"role": msg.get("role"), "content": msg.get("content", "")[:200]}  # Truncate for brevity
+            for msg in msg.conversation_history[-3:]  # Last 3 messages for context
+        ],
+        "current_itinerary": msg.itinerary  # Include current itinerary for context
     }
 
     try:
@@ -874,8 +1053,117 @@ Respond with JSON only (no fences, no prose).
         # Server-side safety: ensure IDs and remove overlaps
         final_plan = ensure_ids(final_plan)
         final_plan = enforce_no_overlaps(final_plan)
+        
+        # Extract options from tool results if not already in final_plan
+        if not final_plan.get("options"):
+            final_plan["options"] = []
+        
+        # Extract ALL flight options
+        for result in tool_results:
+            if result.get("tool") == "search_flights":
+                try:
+                    flight_data = json.loads(result.get("result", "{}"))
+                    # Get both 'best' and 'other' flights
+                    all_flights = []
+                    results = flight_data.get("results", {})
+                    all_flights.extend(results.get("best", []))
+                    all_flights.extend(results.get("other", []))
+                    
+                    for i, flight in enumerate(all_flights):  # ALL flights
+                        if flight.get("total_price"):
+                            duration_min = flight.get('out_duration', 0)
+                            hours = duration_min // 60
+                            mins = duration_min % 60
+                            
+                            # Extract departure date/time from first leg
+                            departure_time = ""
+                            arrival_time = ""
+                            legs_out = flight.get('legs_out', [])
+                            if legs_out and len(legs_out) > 0:
+                                first_leg = legs_out[0]
+                                departure_time = first_leg.get('departure_time', '')
+                                # Get arrival time from last leg for end-to-end time
+                                last_leg = legs_out[-1]
+                                arrival_time = last_leg.get('arrival_time', '')
+                            
+                            # Build enhanced title with time
+                            title_parts = []
+                            if departure_time:
+                                title_parts.append(f"Departs {departure_time}")
+                            title_parts.append(f"${flight.get('total_price')}")
+                            title_parts.append(f"{hours}h {mins}m")
+                            title = " • ".join(title_parts)
+                            
+                            # Build enhanced description
+                            desc_parts = []
+                            if departure_time and arrival_time:
+                                desc_parts.append(f"🕐 {departure_time} → {arrival_time}")
+                            desc_parts.append(f"⏱️ Duration: {hours}h {mins}m")
+                            desc_parts.append(f"💵 Price: ${flight.get('total_price')} {flight.get('currency', 'USD')}")
+                            description = " | ".join(desc_parts)
+                            
+                            final_plan["options"].append({
+                                "option_id": f"flight_option_{i}_{uuid.uuid4().hex[:8]}",
+                                "type": "flight",
+                                "category": "outbound_flight",
+                                "title": title,
+                                "description": description,
+                                "data": flight,
+                                "replaces_itinerary_id": None
+                            })
+                except Exception as e:
+                    logs.append(f"Error extracting flight options: {e}")
+        
+        # Extract event options
+        for result in tool_results:
+            if result.get("tool") == "search_events":
+                try:
+                    event_data = json.loads(result.get("result", "{}"))
+                    events = event_data.get("events", [])
+                    for i, event in enumerate(events):  # ALL events
+                        if event.get("title"):
+                            venue_name = event.get("venue", {}).get("name", "")
+                            price_text = event.get("price_text", "Free") if event.get("price_text") else ""
+                            start_date = event.get("start_date", "")
+                            start_time = event.get("start_time", "")
+                            
+                            # Build description
+                            desc_parts = []
+                            if venue_name:
+                                desc_parts.append(f"📍 {venue_name}")
+                            if start_date:
+                                desc_parts.append(f"📅 {start_date}")
+                            if start_time:
+                                desc_parts.append(f"🕒 {start_time}")
+                            if price_text:
+                                desc_parts.append(f"💵 {price_text}")
+                            
+                            description = " | ".join(desc_parts) if desc_parts else event.get("description", "")
+                            
+                            final_plan["options"].append({
+                                "option_id": f"event_option_{i}_{uuid.uuid4().hex[:8]}",
+                                "type": "event",
+                                "category": "activity_option",
+                                "title": event.get("title"),
+                                "description": description,
+                                "data": event,
+                                "replaces_itinerary_id": None
+                            })
+                except Exception as e:
+                    logs.append(f"Error extracting event options: {e}")
+        
+        # Update logs if options were added
+        options_count = len(final_plan.get("options", []))
+        print(f"DEBUG: Extracted {options_count} total options")
+        if final_plan.get("options"):
+            final_plan["logs"] = final_plan.get("logs", []) + [
+                f"\n✨ Found {len(final_plan['options'])} alternative options for you to choose from!"
+            ]
+        else:
+            print("WARNING: No options in final_plan!")
 
         ctx.logger.info(final_plan)
+        print(f"DEBUG: Returning response with {len(final_plan.get('options', []))} options")
 
         return AgentPlanResponse(**final_plan)
 

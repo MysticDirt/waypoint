@@ -34,3 +34,15 @@ code {
 ::-webkit-scrollbar-thumb:hover {
   background: #555;
 }
+
+/* Custom numbered map markers */
+.custom-numbered-marker {
+  background: transparent !important;
+  border: none !important;
+}
+
+.custom-numbered-marker > div {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
