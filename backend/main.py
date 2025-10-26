@@ -40,6 +40,9 @@ app.add_middleware(
 
 class UserGoalRequest(BaseModel):
     prompt: str
+    conversation_history: List[Dict[str, Any]] = []
+    itinerary: List[Dict[str, Any]] = []
+    locations: List[Dict[str, Any]] = []
 
 # This is the model *we expect back* from the agent
 class AgentPlanResponse(BaseModel):
@@ -109,11 +112,16 @@ async def create_plan(request: UserGoalRequest):
             f"Always plan into the future from now; avoid proposing past dates.\n"
         )
         prompt_with_context = f"{context_prefix}{request.prompt}"
-        # Forward request to uAgent
+        # Forward request to uAgent with conversation history
         async with httpx.AsyncClient() as client:
             response = await client.post(
                 f"{AGENT_BASE_URL}/plan",
-                json={"prompt": prompt_with_context},
+                json={
+                    "prompt": prompt_with_context,
+                    "conversation_history": request.conversation_history,
+                    "itinerary": request.itinerary,
+                    "locations": request.locations
+                },
                 timeout=30.0
             )
             print(f"Response status: {response.status_code}")

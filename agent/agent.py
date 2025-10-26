@@ -60,6 +60,9 @@ groq_client = Groq(api_key=GROQ_API_KEY)
 
 class PlanRequest(Model):
     prompt: str  # e.g., "Plan a cheap cultural weekend in Chicago"
+    conversation_history: list = []  # List of previous messages
+    itinerary: list = []  # Existing itinerary items
+    locations: list = []  # Existing locations
 
 class AgentPlanResponse(Model):
     status: str           # "success" | "needs_clarification" | "error"
@@ -652,7 +655,7 @@ You are a planning AI. Output a JSON array ONLY. No prose, no notes, no markdown
 Rules:
 - If the user does not specify an ORIGIN airport for flights, use the user's home metro based on profile (e.g., {current_profile.city}) and prefer the primary airport (use our heuristic).
 - For events, default search 'location' to the user's city: {current_profile.city}.
-- Never pick dates in the past; if ambiguous, choose the next future Fri–Sun weekend (4–8 weeks out).
+- Never pick dates in the past.
 - Flights query MUST include origin, destination, and a future depart date (YYYY-MM-DD).
 - If unsure about return, include a best-guess (Fri–Sun).
 - Tools you can call: {json.dumps(list(AVAILABLE_TOOLS.keys()))}
@@ -700,6 +703,30 @@ Output format:
             logs.append(f"Unknown tool requested: {name}")
     
     ctx.logger.info(tool_results)
+    
+    # Extract any clarification questions from tool results
+    clarification_needed = False
+    all_questions = []
+    for result in tool_results:
+        try:
+            result_data = json.loads(result.get("result", "{}"))
+            if result_data.get("user_prompt_needed"):
+                clarification_needed = True
+                suggested = result_data.get("suggested_questions", [])
+                if suggested:
+                    all_questions.extend(suggested)
+                error_msg = result_data.get("error", "")
+                if error_msg:
+                    logs.append(f"⚠️ {error_msg}")
+        except:
+            pass
+    
+    # Add questions to logs prominently
+    if all_questions:
+        logs.append("\n❓ I need some clarification to help you better:")
+        for i, question in enumerate(all_questions, 1):
+            logs.append(f"  {i}. {question}")
+        logs.append("\nPlease answer in the chat below!")
 
     # ---- Stage 2: Synthesis (force JSON object)
     synthesis_system_prompt = """

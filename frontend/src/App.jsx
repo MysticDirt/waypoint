@@ -48,6 +48,10 @@ function App() {
   const [isLoading, setIsLoading] = useState(false)
   const [hasChanges, setHasChanges] = useState(false)
   const [error, setError] = useState(null)
+  const [conversation, setConversation] = useState([]) // Array of {role: 'user'|'assistant', content: string, timestamp: Date}
+  const [chatInput, setChatInput] = useState('')
+  const [conversationId, setConversationId] = useState(null)
+  const chatEndRef = useRef(null)
 
   const handleSubmit = async (e) => {
     e.preventDefault()
@@ -56,14 +60,44 @@ function App() {
     setIsLoading(true)
     setError(null)
     
+    // Add user message to conversation
+    const userMessage = { role: 'user', content: prompt, timestamp: new Date() }
+    setConversation(prev => [...prev, userMessage])
+    
     try {
-      const response = await axios.post('http://127.0.0.1:8000/plan', { prompt })
+      const response = await axios.post('http://127.0.0.1:8000/plan', { 
+        prompt,
+        conversation_history: conversation 
+      })
+      
+      // Add assistant response to conversation
+      const assistantMessage = {
+        role: 'assistant',
+        content: response.data.logs?.join('\n') || 'Plan generated successfully',
+        timestamp: new Date(),
+        status: response.data.status
+      }
+      setConversation(prev => [...prev, assistantMessage])
+      
       setItinerary(response.data.itinerary || [])
       setLocations(response.data.locations || [])
       setHasChanges(false)
+      setPrompt('') // Clear the main input after submission
+      
+      // Generate conversation ID if this is a new conversation
+      if (!conversationId) {
+        setConversationId(Date.now().toString())
+      }
     } catch (err) {
       console.error('Error planning:', err)
       setError('Failed to create plan. Please try again.')
+      const errorMessage = {
+        role: 'assistant',
+        content: 'Error: Failed to create plan. Please try again.',
+        timestamp: new Date(),
+        status: 'error'
+      }
+      setConversation(prev => [...prev, errorMessage])
     } finally {
       setIsLoading(false)
     }
@@ -90,11 +124,23 @@ function App() {
     setIsLoading(true)
     setError(null)
     
+    const refineMessage = { role: 'user', content: 'Updating plan based on my changes...', timestamp: new Date() }
+    setConversation(prev => [...prev, refineMessage])
+    
     try {
       const response = await axios.post('http://127.0.0.1:8000/refine', {
         itinerary,
         locations
       })
+      
+      const assistantMessage = {
+        role: 'assistant',
+        content: response.data.logs?.join('\n') || 'Plan updated successfully',
+        timestamp: new Date(),
+        status: response.data.status
+      }
+      setConversation(prev => [...prev, assistantMessage])
+      
       setItinerary(response.data.itinerary || [])
       setLocations(response.data.locations || [])
       setHasChanges(false)
@@ -105,6 +151,67 @@ function App() {
       setIsLoading(false)
     }
   }
+  
+  const handleChatSubmit = async (e) => {
+    e.preventDefault()
+    if (!chatInput.trim() || isLoading) return
+    
+    setIsLoading(true)
+    setError(null)
+    
+    // Add user message to conversation
+    const userMessage = { role: 'user', content: chatInput, timestamp: new Date() }
+    setConversation(prev => [...prev, userMessage])
+    setChatInput('')
+    
+    try {
+      // Send follow-up message with full conversation context
+      const response = await axios.post('http://127.0.0.1:8000/plan', { 
+        prompt: chatInput,
+        conversation_history: [...conversation, userMessage],
+        itinerary: itinerary,
+        locations: locations
+      })
+      
+      // Add assistant response
+      const assistantMessage = {
+        role: 'assistant',
+        content: response.data.logs?.join('\n') || 'Updated based on your input',
+        timestamp: new Date(),
+        status: response.data.status
+      }
+      setConversation(prev => [...prev, assistantMessage])
+      
+      // Update itinerary if provided
+      if (response.data.itinerary) {
+        setItinerary(response.data.itinerary)
+      }
+      if (response.data.locations) {
+        setLocations(response.data.locations)
+      }
+      setHasChanges(false)
+    } catch (err) {
+      console.error('Error in chat:', err)
+      const errorMessage = {
+        role: 'assistant',
+        content: 'Error: Failed to process your message. Please try again.',
+        timestamp: new Date(),
+        status: 'error'
+      }
+      setConversation(prev => [...prev, errorMessage])
+    } finally {
+      setIsLoading(false)
+    }
+  }
+  
+  // Auto-scroll chat to bottom
+  useEffect(() => {
+    chatEndRef.current?.scrollIntoView({ behavior: 'smooth' })
+  }, [conversation])
+  
+  // Check if last message needs clarification
+  const needsClarification = conversation.length > 0 && 
+    conversation[conversation.length - 1].status === 'needs_clarification'
 
   const getTypeColor = (type) => {
     switch(type) {
@@ -164,6 +271,85 @@ function App() {
               {error && (
                 <div className="mt-4 p-3 bg-red-100 border border-red-300 text-red-700 rounded-lg">
                   {error}
+                </div>
+              )}
+              
+              {/* Chat/Conversation Panel */}
+              {conversation.length > 0 && (
+                <div className="mt-4 border border-gray-300 rounded-lg bg-white">
+                  <div className="bg-gray-100 px-4 py-2 border-b border-gray-300 rounded-t-lg">
+                    <h3 className="font-semibold text-sm text-gray-700">💬 Conversation with AI</h3>
+                  </div>
+                  <div className="max-h-64 overflow-y-auto p-4 space-y-3">
+                    {conversation.map((message, index) => (
+                      <div
+                        key={index}
+                        className={`flex ${message.role === 'user' ? 'justify-end' : 'justify-start'}`}
+                      >
+                        <div
+                          className={`max-w-[80%] rounded-lg px-4 py-3 ${
+                            message.role === 'user'
+                              ? 'bg-blue-600 text-white'
+                              : message.status === 'error'
+                              ? 'bg-red-100 text-red-800 border border-red-300'
+                              : message.status === 'needs_clarification'
+                              ? 'bg-yellow-50 text-yellow-900 border-2 border-yellow-400 shadow-md'
+                              : 'bg-gray-100 text-gray-800 border border-gray-300'
+                          }`}
+                        >
+                          {message.status === 'needs_clarification' && (
+                            <div className="flex items-center gap-2 mb-2 pb-2 border-b border-yellow-300">
+                              <span className="text-xl">❓</span>
+                              <span className="font-semibold text-sm">I need your help!</span>
+                            </div>
+                          )}
+                          <div className="text-sm whitespace-pre-wrap leading-relaxed">{message.content}</div>
+                          <div className={`text-xs mt-2 ${
+                            message.role === 'user' ? 'text-blue-100' : 'text-gray-500'
+                          }`}>
+                            {new Date(message.timestamp).toLocaleTimeString()}
+                          </div>
+                        </div>
+                      </div>
+                    ))}
+                    <div ref={chatEndRef} />
+                  </div>
+                  
+                  {/* Chat Input */}
+                  <form onSubmit={handleChatSubmit} className={`border-t p-3 ${
+                    needsClarification ? 'bg-yellow-50 border-yellow-300' : 'border-gray-300'
+                  }`}>
+                    {needsClarification && (
+                      <div className="mb-2 text-xs text-yellow-800 font-medium">
+                        👆 Please answer the questions above
+                      </div>
+                    )}
+                    <div className="flex gap-2">
+                      <input
+                        type="text"
+                        value={chatInput}
+                        onChange={(e) => setChatInput(e.target.value)}
+                        placeholder={needsClarification ? "Type your answer here..." : "Reply to the AI or ask follow-up questions..."}
+                        className={`flex-1 px-3 py-2 text-sm border rounded-lg focus:outline-none focus:ring-2 ${
+                          needsClarification 
+                            ? 'border-yellow-400 focus:ring-yellow-500 bg-white' 
+                            : 'border-gray-300 focus:ring-blue-500'
+                        }`}
+                        disabled={isLoading}
+                      />
+                      <button
+                        type="submit"
+                        disabled={isLoading || !chatInput.trim()}
+                        className={`px-4 py-2 text-sm rounded-lg transition-colors disabled:bg-gray-400 disabled:cursor-not-allowed ${
+                          needsClarification
+                            ? 'bg-yellow-500 text-white hover:bg-yellow-600'
+                            : 'bg-blue-600 text-white hover:bg-blue-700'
+                        }`}
+                      >
+                        {needsClarification ? 'Answer' : 'Send'}
+                      </button>
+                    </div>
+                  </form>
                 </div>
               )}
             </div>
